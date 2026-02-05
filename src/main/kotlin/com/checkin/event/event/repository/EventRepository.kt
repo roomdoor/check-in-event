@@ -15,6 +15,9 @@ interface EventRepository : JpaRepository<Event, Long> {
     fun findByIdForUpdate(@Param("id") id: Long): Event?
 
     @Modifying
-    @Query("update Event e set e.acceptedCount = e.acceptedCount + 1 where e.id = :id")
-    fun incrementAcceptedCount(@Param("id") id: Long): Int
+    @Query("update Event e set e.acceptedCount = e.acceptedCount + :delta where e.id = :id")
+    fun incrementAcceptedCountBy(
+        @Param("id") id: Long,
+        @Param("delta") delta: Int,
+    ): Int
 }
