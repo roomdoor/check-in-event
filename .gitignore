@@ -16,3 +16,6 @@ out/
 
 # Local tooling
 .sisyphus/
+
+# 로드테스트 결과 (로컬 회차는 커밋하지 않는다)
+loadtest/results/
