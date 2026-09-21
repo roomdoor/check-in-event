@@ -1,11 +1,14 @@
 name: build
 
+# push 는 main 과 v* 태그에서만 온다. workflow_dispatch 는 두지 않는다 — 있으면
+# 아무 브랜치에서 수동 실행해 GHCR 에 밀 수 있고, GitHub 은 dispatch 에 브랜치
+# 제한을 걸 방법이 없다. 그래서 아래의 "pull_request 가 아니면 publish" 는
+# 곧 "main 이거나 태그면 publish" 와 같다.
 on:
   push:
     branches: [main]
     tags: ['v*']
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,10 +24,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # 유일한 테스트(contextLoads)가 @SpringBootTest 라 실제 MySQL·Redis 에 붙어야
-    # 컨텍스트가 뜬다. 테스트를 빼고 bootJar 만 돌리는 대신 의존성을 옆에 세운다 —
-    # 그래야 "이 이미지가 실제 DB·Redis 앞에서 기동하는가" 를 CI 가 매번 확인한다.
-    # 값은 docker-compose.yml 및 application.yml 과 같다.
+    # 유일한 테스트(contextLoads)가 @SpringBootTest 라 실제 MySQL 에 붙어야 컨텍스트가
+    # 뜬다. 테스트를 빼는 대신 의존성을 옆에 세운다. 접속 정보(계정·DB명·포트)는
+    # application.yml 과 같다. compose 의 서버 옵션(문자셋·시간대·AOF)은 여기 없다 —
+    # 기동 확인에는 필요 없고, 측정은 이 러너가 아니라 EC2 에서 한다.
     services:
       mysql:
         image: mysql:8.0
@@ -33,7 +36,7 @@ jobs:
           MYSQL_DATABASE: checkin_event
         ports: ['3306:3306']
         options: >-
-          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
@@ -47,11 +50,17 @@ jobs:
           --health-retries 20
 
     steps:
+      # 토큰을 .git/config 에 남기지 않는다. 이 잡은 ./gradlew build 로 서드파티
+      # Gradle 플러그인 코드를 실행하는데, 워크플로 권한이 packages: write 라
+      # 그 코드가 토큰을 읽으면 GHCR 에 쓸 수 있다. 명시적으로 secrets 를 넘기는
+      # 로그인 스텝만 토큰을 본다.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      # 17 은 build.gradle.kts 의 toolchain 이자 gradle-daemon-jvm.properties 가
-      # 데몬에 고정한 버전이다. 다른 버전을 깔아도 foojay 가 17 을 받아오긴
-      # 하지만, 굳이 한 번 더 내려받을 이유가 없다.
+      # 17 은 java.toolchain 이자 gradle-daemon-jvm.properties 가 데몬에 고정한
+      # 버전이다. 그 파일에 foojay 다운로드 URL 이 있어 없어도 받아오지만,
+      # 미리 깔아두면 그 단계를 건너뛴다.
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -64,6 +73,29 @@ jobs:
       - name: Build and test
         run: ./gradlew build
 
+      # contextLoads 는 Gradle 의 테스트 JVM 에서 돈다. 이미지 자체는 검증하지
+      # 않는다 — 베이스 JRE 버전이 toolchain 과 어긋나도, ENTRYPOINT 경로가 틀려도
+      # 여기까지는 통과한다. 그래서 이미지를 실제로 띄워본다. 서비스가 러너의
+      # 3306/6379 에 열려 있으니 --network host 로 붙는다.
+      - name: Build image
+        run: docker build -t smoke:ci .
+
+      - name: Smoke the image against MySQL and Redis
+        run: |
+          docker run -d --name smoke --network host smoke:ci
+          for i in $(seq 1 30); do
+            if curl -sf -X POST http://localhost:8080/api/events \
+                 -H 'Content-Type: application/json' \
+                 -d '{"name":"ci-smoke","capacity":1}' >/dev/null; then
+              echo "이미지 기동 확인 ($((i*2))초)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "이미지가 60초 안에 뜨지 않았다" >&2
+          docker logs smoke >&2
+          exit 1
+
       # PR 에서는 이미지를 밀지 않는다. 빌드가 되는지만 확인한다.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -73,25 +105,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # latest=false: 기본(auto)이면 semver 태그에도 latest 가 붙어서, 옛 커밋에
+      # v1.0.1 을 달면 그 런이 latest 를 덮어쓴다. latest 는 main 에만.
       - name: Derive image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
 
       # linux/amd64 단일 아키텍처는 의도된 선택이다. 측정 인스턴스가 x86(c7i 계열)이고,
       # arm64 이미지를 에뮬레이션으로 돌리면 JVM 기동과 스케줄링이 왜곡되어 측정값이
-      # 오염된다. 멀티아치 빌드를 추가하지 말 것.
+      # 오염된다. platforms 를 명시해 러너 아키텍처에 따라 바뀌지 않게 한다.
+      # 멀티아치 빌드를 추가하지 말 것.
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
