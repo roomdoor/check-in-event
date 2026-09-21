@@ -1,0 +1,97 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# main 에 연속으로 푸시되면 두 런이 겹치고, 늦게 끝난 쪽이 latest 를 가져간다.
+# 순서가 뒤집히면 latest 가 더 오래된 커밋을 가리킬 수 있어 앞선 런을 취소한다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # 유일한 테스트(contextLoads)가 @SpringBootTest 라 실제 MySQL·Redis 에 붙어야
+    # 컨텍스트가 뜬다. 테스트를 빼고 bootJar 만 돌리는 대신 의존성을 옆에 세운다 —
+    # 그래야 "이 이미지가 실제 DB·Redis 앞에서 기동하는가" 를 CI 가 매번 확인한다.
+    # 값은 docker-compose.yml 및 application.yml 과 같다.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: checkin_event
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7.2
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 17 은 build.gradle.kts 의 toolchain 이자 gradle-daemon-jvm.properties 가
+      # 데몬에 고정한 버전이다. 다른 버전을 깔아도 foojay 가 17 을 받아오긴
+      # 하지만, 굳이 한 번 더 내려받을 이유가 없다.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test
+        run: ./gradlew build
+
+      # PR 에서는 이미지를 밀지 않는다. 빌드가 되는지만 확인한다.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # linux/amd64 단일 아키텍처는 의도된 선택이다. 측정 인스턴스가 x86(c7i 계열)이고,
+      # arm64 이미지를 에뮬레이션으로 돌리면 JVM 기동과 스케줄링이 왜곡되어 측정값이
+      # 오염된다. 멀티아치 빌드를 추가하지 말 것.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

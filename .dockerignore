@@ -1,0 +1,6 @@
+*
+!build/libs/check-in-event-*.jar
+# Spring Boot 가 같이 만드는 plain jar 는 제외한다. ./gradlew build 가 jar 태스크도
+# 돌려서 이게 생기는데, 남겨두면 Dockerfile 의 COPY 글로브가 파일 두 개를 잡아
+# 빌드가 깨진다. bootJar 만 돌리면 안 생기지만 CI 는 build 를 쓴다.
+build/libs/*-plain.jar
