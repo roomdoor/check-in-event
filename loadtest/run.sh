@@ -92,6 +92,16 @@ case "${DUP_RATIO}" in
   0|1|0.[0-9]|0.[0-9][0-9]) ;;
   *) echo "DUP_RATIO 는 0 이상 1 이하여야 한다(예: 0, 0.1, 0.25, 1). 받은 값: '${DUP_RATIO}'" >&2; exit 1 ;;
 esac
+# 나머지 숫자 입력도 전부 막아둔다. 드레인 상한이 '10m' 이면 비교가 깨지는데
+# if 조건 안이라 set -e 가 안 걸려서 상한이 영영 안 잡히고 루프가 안 끝난다.
+# WRITER_* 는 jq 로 바로 들어가서, 'ms' 한 글자에 회차가 다 끝난 뒤 결과
+# 파일을 쓰는 순간 죽는다.
+for _name in DRAIN_CAP_SECONDS DRAIN_POLL_SECONDS WRITER_BATCH_SIZE WRITER_DELAY_MS PRE_VUS MAX_VUS; do
+  eval "_val=\${${_name}}"
+  case "${_val}" in
+    ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
+  esac
+done
 
 command -v k6 >/dev/null || { echo "k6 가 없다." >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq 가 없다." >&2; exit 1; }
@@ -208,15 +218,18 @@ done
 k6_reqs=0
 k6_dropped=0
 k6_p95=0
+k6_dup_sent=0
 if [ -f "${run_dir}/summary.json" ]; then
   k6_reqs="$(jq -r '.metrics.http_reqs.count // 0' "${run_dir}/summary.json")" || k6_reqs=0
   k6_dropped="$(jq -r '.metrics.dropped_iterations.count // 0' "${run_dir}/summary.json")" || k6_dropped=0
   k6_p95="$(jq -r '.metrics.http_req_duration["p(95)"] // 0' "${run_dir}/summary.json")" || k6_p95=0
+  k6_dup_sent="$(jq -r '.metrics.checkin_duplicate_sent.count // 0' "${run_dir}/summary.json")" || k6_dup_sent=0
 else
   echo "k6 요약 파일이 없다. 부하 지표 없이 저장소 집계만 한다." >&2
 fi
 case "${k6_reqs}" in ''|*[!0-9]*) k6_reqs=0 ;; esac
 case "${k6_dropped}" in ''|*[!0-9]*) k6_dropped=0 ;; esac
+case "${k6_dup_sent}" in ''|*[!0-9]*) k6_dup_sent=0 ;; esac
 
 # 불변식. 하나라도 깨지면 이 회차는 성능 이전에 정확성이 틀린 것이다.
 violations=""
@@ -237,8 +250,17 @@ fi
 [ "${drain_capped}" = false ] \
   || violations="${violations} 드레인미완(${DRAIN_CAP_SECONDS}s 초과. Redis-DB 대조 생략됨)"
 
+# 초과 승인은 이 스크립트가 존재하는 이유다. 그러니 고장난 카운터에 기대면
+# 안 된다 — events.accepted_count 는 redis 모드에서 늘 0 이라(이슈 #1)
+# 0 <= capacity 로 언제나 통과한다. 정원 1만에 4만을 받아들여도 뜨는 건
+# 아래 '카운터불일치' 하나뿐이고, 그건 무시하라고 적어둔 항목이다.
+# 실제로 저장된 행과 Redis 카운터로 따로 본다.
+[ "${db_accepted:-0}" -le "${evt_capacity:-0}" ] \
+  || violations="${violations} 초과승인(승인행=${db_accepted} > capacity=${evt_capacity})"
+[ "${redis_count:-0}" -le "${evt_capacity:-0}" ] \
+  || violations="${violations} 초과승인_redis(count=${redis_count} > capacity=${evt_capacity})"
 [ "${evt_accepted:-0}" -le "${evt_capacity:-0}" ] \
-  || violations="${violations} 초과승인(accepted_count=${evt_accepted} > capacity=${evt_capacity})"
+  || violations="${violations} 초과승인_카운터(accepted_count=${evt_accepted} > capacity=${evt_capacity})"
 # 스키마 점검에 가깝다. 두 경로 모두 중복 행을 물리적으로 못 만든다
 # (db 모드는 유니크 제약, redis 모드는 insert ignore). 유니크 인덱스가
 # 사라진 경우에만 걸린다 — 동시 중복 차단이 되는지를 보는 검사가 아니다.
@@ -252,12 +274,28 @@ fi
 # 배치 반환값이 -2 로 와서 카운터가 한 번도 안 오른다).
 [ "${evt_accepted:-0}" -eq "${db_accepted:-0}" ] \
   || violations="${violations} 카운터불일치(accepted_count=${evt_accepted} vs 승인행=${db_accepted})"
-if [ "${MODE}" = "redis" ] && [ "${drain_capped}" = false ]; then
-  [ "${redis_count:-0}" -eq "${db_accepted:-0}" ] \
-    || violations="${violations} Redis-DB불일치(redis=${redis_count} db=${db_accepted})"
+if [ "${MODE}" = "redis" ]; then
+  # 드레인 상태와 무관하게 성립해야 한다. 카운터와 집합이 어긋나면 Lua 가
+  # INCR 과 SADD 중 하나만 한 것이다.
+  [ "${redis_count:-0}" -eq "${redis_users:-0}" ] \
+    || violations="${violations} Redis내부불일치(count=${redis_count} users=${redis_users})"
   [ "${redis_users:-0}" -eq "${redis_pos:-0}" ] \
     || violations="${violations} 순번누락(users=${redis_users} pos=${redis_pos})"
+  # 이건 저장이 다 끝나야 성립한다.
+  if [ "${drain_capped}" = false ]; then
+    [ "${redis_count:-0}" -eq "${db_accepted:-0}" ] \
+      || violations="${violations} Redis-DB불일치(redis=${redis_count} db=${db_accepted})"
+  fi
 fi
+
+# 중복을 보내라고 했는데 한 건도 안 나갔으면 중복 경로를 안 잰 것이다.
+# acceptedKeys 가 안 차면(정원이 작거나 이벤트가 닫혀 있으면) 그렇게 된다.
+case "${DUP_RATIO}" in
+  0) ;;
+  *) [ "${k6_dup_sent}" -gt 0 ] \
+       || violations="${violations} 중복미발생(DUP_RATIO=${DUP_RATIO} 인데 재사용 0건)" ;;
+esac
+
 [ -n "${violations}" ] || violations="none"
 
 jq -n \
@@ -273,6 +311,7 @@ jq -n \
   --argjson drain_seconds "${drain_seconds}" --argjson drain_capped "${drain_capped}" \
   --argjson writer_batch "${WRITER_BATCH_SIZE}" --argjson writer_delay "${WRITER_DELAY_MS}" \
   --argjson k6_reqs "${k6_reqs}" --argjson k6_dropped "${k6_dropped}" --argjson k6_p95 "${k6_p95}" \
+  --argjson k6_dup_sent "${k6_dup_sent}" \
   '{run_id:$run_id, mode:$mode, started_at:$started_at, event_id:$event_id,
     load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
@@ -280,7 +319,8 @@ jq -n \
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},
     redis:{count:$redis_count, users:$redis_users, pos:$redis_pos, stream_len:$stream_len},
     drain:{seconds:$drain_seconds, capped:$drain_capped},
-    k6:{requests:$k6_reqs, dropped_iterations:$k6_dropped, p95_ms:$k6_p95},
+    k6:{requests:$k6_reqs, dropped_iterations:$k6_dropped, p95_ms:$k6_p95,
+        duplicate_sent:$k6_dup_sent},
     violations:$violations}' > "${run_dir}/result.json"
 
 echo
@@ -289,7 +329,7 @@ echo "정원 ${evt_capacity} / 승인 ${evt_accepted}"
 echo "DB   승인 ${db_accepted} · 거부 ${db_rejected} · 합계 ${db_total} · 중복키 ${db_dup_keys}"
 [ "${MODE}" = "db" ] || echo "Redis count ${redis_count} · users ${redis_users} · pos ${redis_pos} · 스트림 누적 ${stream_len}(XTRIM 미적용)"
 [ "${MODE}" = "db" ] || echo "드레인 ${drain_seconds}s (상한초과=${drain_capped})"
-echo "k6   요청 ${k6_reqs} · 버려진 이터레이션 ${k6_dropped} · p95 ${k6_p95}ms"
+echo "k6   요청 ${k6_reqs} · 버려진 이터레이션 ${k6_dropped} · 재사용 ${k6_dup_sent} · p95 ${k6_p95}ms"
 echo "불변식 위반: ${violations}"
 echo "결과: ${run_dir}/result.json"
 
