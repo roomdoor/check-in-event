@@ -2,7 +2,6 @@ package com.checkin.event.checkin.service
 
 import com.checkin.event.checkin.repository.CheckInBatchRepository
 import com.checkin.event.checkin.repository.CheckInInsertRow
-import com.checkin.event.event.repository.EventRepository
 import org.springframework.data.redis.connection.stream.MapRecord
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
@@ -12,7 +11,6 @@ import java.time.ZoneId
 @Service
 class CheckInStreamPersistService(
     private val checkInBatchRepository: CheckInBatchRepository,
-    private val eventRepository: EventRepository,
 ) {
     @Transactional
     fun persist(records: List<MapRecord<String, String, String>>): Boolean {
@@ -44,11 +42,11 @@ class CheckInStreamPersistService(
         checkInBatchRepository.insertIgnore(rows)
 
         // 배치 반환값으로 "몇 건 들어갔나"를 셀 수 없다(insertIgnore 주석 참고).
-        // 늘리는 대신 실제 저장된 행을 세서 덮어쓴다. 같은 트랜잭션이라 방금
-        // 넣은 행이 보이고, 재처리로 같은 배치가 두 번 와도 결과가 같다.
-        // 과거에 어긋나 있던 값도 다음 배치에서 저절로 맞춰진다.
+        // 늘리는 대신 실제 저장된 행을 세서 맞춘다. 같은 트랜잭션이라 방금 넣은
+        // 행이 보이고, 재처리로 같은 배치가 두 번 와도 결과가 같다. 과거에
+        // 어긋나 있던 값도 다음 배치에서 저절로 맞춰진다.
         rows.map { it.eventId }.distinct().forEach { eventId ->
-            eventRepository.setAcceptedCount(eventId, checkInBatchRepository.countAccepted(eventId))
+            checkInBatchRepository.syncAcceptedCount(eventId)
         }
 
         return true
