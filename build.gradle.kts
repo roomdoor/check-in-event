@@ -36,3 +36,10 @@ dependencies {
 tasks.withType<Test> {
     useJUnitPlatform()
 }
+
+// plain jar 는 만들지 않고 실행 jar 의 파일명을 고정한다. Dockerfile 이 정확한
+// 경로를 COPY 하게 하려는 것이다. 글로브(check-in-event-*.jar)를 쓰면 BuildKit 은
+// 파일이 둘일 때 실패하지 않고 정렬상 마지막 것을 조용히 넣는다 — 버전을 올린 뒤
+// clean 없이 bootJar 만 다시 돌리면 옛 jar 가 이미지에 들어가고 에러가 없다.
+tasks.jar { enabled = false }
+tasks.bootJar { archiveFileName.set("app.jar") }

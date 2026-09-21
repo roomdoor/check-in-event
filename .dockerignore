@@ -1,0 +1,4 @@
+*
+# build.gradle.kts 가 실행 jar 이름을 app.jar 로 고정하고 plain jar 를 만들지 않으므로
+# 이 파일 하나만 들어간다.
+!build/libs/app.jar
