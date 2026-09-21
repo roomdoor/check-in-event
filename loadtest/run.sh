@@ -46,6 +46,12 @@ fi
 DRAIN_CAP_SECONDS="${DRAIN_CAP_SECONDS:-600}"
 DRAIN_POLL_SECONDS="${DRAIN_POLL_SECONDS:-2}"
 
+# 드레이너 설정은 앱 기동 인자라 이 스크립트가 바꾸지 못한다. 결과에 조건을
+# 남기려고 받아 적기만 한다 — 앱을 띄운 값과 반드시 같게 줄 것.
+#   --checkin.redis.writer.batch-size=1000 --checkin.redis.writer.delay=100
+WRITER_BATCH_SIZE="${WRITER_BATCH_SIZE:-200}"
+WRITER_DELAY_MS="${WRITER_DELAY_MS:-500}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRIPT_DIR}/results}"
 
@@ -147,12 +153,39 @@ redis_pos="$(redis_cmd HLEN "event:${EVENT_ID}:pos")"
 stream_len="$(redis_cmd XLEN checkins:stream)"
 : "${redis_count:=0}"
 
-k6_reqs="$(jq -r '.metrics.http_reqs.count // 0' "${run_dir}/summary.json")"
-k6_dropped="$(jq -r '.metrics.dropped_iterations.count // 0' "${run_dir}/summary.json")"
-k6_p95="$(jq -r '.metrics.http_req_duration["p(95)"] // 0' "${run_dir}/summary.json")"
+# k6 가 요약을 못 남기고 죽는 경우가 있다(스크립트 오류, 대상 불통, OOM).
+# 그때 jq 를 그냥 부르면 set -e 로 여기서 스크립트가 끝나 버려서, 아래
+# 불변식 검사가 정작 필요한 순간에 돌지 않는다.
+k6_reqs=0
+k6_dropped=0
+k6_p95=0
+if [ -f "${run_dir}/summary.json" ]; then
+  k6_reqs="$(jq -r '.metrics.http_reqs.count // 0' "${run_dir}/summary.json")" || k6_reqs=0
+  k6_dropped="$(jq -r '.metrics.dropped_iterations.count // 0' "${run_dir}/summary.json")" || k6_dropped=0
+  k6_p95="$(jq -r '.metrics.http_req_duration["p(95)"] // 0' "${run_dir}/summary.json")" || k6_p95=0
+else
+  echo "k6 요약 파일이 없다. 부하 지표 없이 저장소 집계만 한다." >&2
+fi
+case "${k6_reqs}" in ''|*[!0-9]*) k6_reqs=0 ;; esac
+case "${k6_dropped}" in ''|*[!0-9]*) k6_dropped=0 ;; esac
 
 # 불변식. 하나라도 깨지면 이 회차는 성능 이전에 정확성이 틀린 것이다.
 violations=""
+
+# 아무 일도 안 일어난 회차부터 걸러야 한다. 나머지 검사는 전부 "같은가" 를
+# 보기 때문에 0 끼리 비교하면 저절로 참이 된다. 앱이 체크인마다 500을 뱉어도
+# 저장이 0건이라 모든 검사를 통과하고 "위반 없음" 이 나온다. 실제로 그랬다.
+[ "${k6_reqs}" -gt 0 ] \
+  || violations="${violations} 부하없음(k6 요청 0건)"
+if [ "${k6_reqs}" -gt 0 ] && [ "${db_total:-0}" -eq 0 ]; then
+  violations="${violations} 저장없음(요청 ${k6_reqs}건인데 저장 0건)"
+fi
+
+# 드레인이 상한에 걸렸다는 건 저장이 따라오지 못했다는 뜻이다. 이 상태에서는
+# 아래 두 검사를 건너뛰므로, 건너뛴 사실 자체를 위반으로 남겨야 한다.
+[ "${drain_capped}" = false ] \
+  || violations="${violations} 드레인미완(${DRAIN_CAP_SECONDS}s 초과. Redis-DB 대조 생략됨)"
+
 [ "${evt_accepted:-0}" -le "${evt_capacity:-0}" ] \
   || violations="${violations} 초과승인(accepted_count=${evt_accepted} > capacity=${evt_capacity})"
 [ "${db_dup_keys:-0}" -eq 0 ] \
@@ -180,9 +213,11 @@ jq -n \
   --argjson redis_count "${redis_count:-0}" --argjson redis_users "${redis_users:-0}" \
   --argjson redis_pos "${redis_pos:-0}" --argjson stream_len "${stream_len:-0}" \
   --argjson drain_seconds "${drain_seconds}" --argjson drain_capped "${drain_capped}" \
+  --argjson writer_batch "${WRITER_BATCH_SIZE}" --argjson writer_delay "${WRITER_DELAY_MS}" \
   --argjson k6_reqs "${k6_reqs}" --argjson k6_dropped "${k6_dropped}" --argjson k6_p95 "${k6_p95}" \
   '{run_id:$run_id, mode:$mode, started_at:$started_at, event_id:$event_id,
     load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio},
+    writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},
     redis:{count:$redis_count, users:$redis_users, pos:$redis_pos, stream_len:$stream_len},
