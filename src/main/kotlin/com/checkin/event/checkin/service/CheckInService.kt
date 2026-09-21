@@ -34,25 +34,35 @@ class CheckInService(
 
         val now = now()
         val accepted = event.isOpen(now) && event.acceptedCount < event.capacity
-        if (accepted) {
-            event.acceptedCount += 1
+        if (!accepted) {
+            // 거절은 원장에 남기지 않는다. 선착순은 정원보다 요청이 훨씬 많아서
+            // 거절까지 저장하면 쓰기의 대부분이 "떨어진 사람" 기록이 된다.
+            // Redis 경로도 같은 이유로 스트림에 넣지 않는다(CheckInRedisStore).
+            // 두 방식의 처리량을 비교하려면 양쪽이 같은 일을 해야 한다.
+            return CheckInResponse(
+                id = null,
+                eventId = eventId,
+                participantKey = normalizedKey,
+                result = CheckInResult.REJECTED,
+                createdAt = now,
+            )
         }
+        event.acceptedCount += 1
 
+        // 여기까지 왔으면 승인이다. 거절은 위에서 저장 없이 반환했다.
         return try {
             checkInRepository.save(
                 CheckIn(
                     event = event,
                     participantKey = normalizedKey,
-                    accepted = accepted,
+                    accepted = true,
                     createdAt = now,
                 ),
             ).toResponse()
         } catch (ex: DataIntegrityViolationException) {
             val stored = checkInRepository.findByEventIdAndParticipantKey(eventId, normalizedKey)
                 ?: throw ex
-            if (accepted) {
-                event.acceptedCount = (event.acceptedCount - 1).coerceAtLeast(0)
-            }
+            event.acceptedCount = (event.acceptedCount - 1).coerceAtLeast(0)
             stored.toResponse()
         }
     }

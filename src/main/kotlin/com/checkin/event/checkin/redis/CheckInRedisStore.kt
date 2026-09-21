@@ -117,16 +117,19 @@ class CheckInRedisStore(
                 return {2, tonumber(pos)}
             end
 
-            -- 2) 이벤트가 닫혀 있으면 거절 기록 후 종료
+            -- 2) 이벤트가 닫혀 있으면 종료. 스트림에 남기지 않는다.
             if allowed ~= '1' then
-                redis.call('XADD', streamKey, '*', 'eventId', eventId, 'userId', userId, 'accepted', '0', 'position', '0', 'ts', ts)
                 return {0, 0}
             end
 
-            -- 3) 정원이 찼으면 거절 기록 후 종료
+            -- 3) 정원이 찼으면 종료. 마찬가지로 남기지 않는다.
+            --
+            -- 선착순은 정원보다 요청이 훨씬 많다. 거절까지 스트림에 넣으면
+            -- 저장 부하의 대부분이 "떨어진 사람" 기록이 된다 - 정원 1000에
+            -- 400 RPM 20초를 넣었을 때 승인 1000 대 거절 5384 였다.
+            -- 거절은 응답으로 알려주는 것으로 끝내고, 원장에는 승인만 남긴다.
             local count = tonumber(redis.call('GET', countKey) or '0')
             if count >= cap then
-                redis.call('XADD', streamKey, '*', 'eventId', eventId, 'userId', userId, 'accepted', '0', 'position', '0', 'ts', ts)
                 return {0, 0}
             end
 
