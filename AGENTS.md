@@ -13,6 +13,12 @@ Use this as the single source of truth for build/test commands and code style.
 ## Quick Commands
 Use the Gradle wrapper for all tasks.
 
+The Gradle daemon itself runs on JDK 17 (`gradle/gradle-daemon-jvm.properties`),
+regardless of `JAVA_HOME`. Gradle 8.14.3 cannot start on JDK 25, and the Kotlin
+1.9.24 compiler cannot either. If no JDK 17 is installed, Gradle downloads one
+via the foojay resolver declared in `settings.gradle.kts`. The packaged jar
+still runs on any JDK 17 or newer.
+
 ```bash
 ./gradlew clean build
 ```
