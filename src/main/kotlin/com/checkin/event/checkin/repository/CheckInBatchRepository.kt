@@ -50,9 +50,10 @@ class CheckInBatchRepository(
      * 999 를 읽은 뒤 누군가 1000 으로 올리고 이쪽이 999 를 덮어쓰면, 다음 요청이
      * 정원이 남았다고 보고 1001 번째를 받는다. 한 문장으로 두면 그 틈이 없다.
      *
-     * COUNT 는 idx_checkins_event_accepted 를 탄다. 거절도 전부 행으로 남기 때문에
-     * 이벤트 하나에 수십만 행이 쌓이고, 덮는 인덱스가 없으면 배치마다 클러스터
-     * 인덱스를 훑어 드레인 시간에 그대로 얹힌다.
+     * COUNT 는 idx_checkins_event_accepted 를 탄다. 승인만 저장하므로 이벤트당
+     * 행 수는 정원을 넘지 않지만, 배치마다 그 전체를 다시 세기 때문에 정원이
+     * 크면 여전히 드레인 시간에 얹힌다. 유니크 인덱스는 accepted 를 담지 않아
+     * 덮지 못한다 - 그것만으로는 행마다 클러스터 인덱스를 다시 읽어야 한다.
      */
     fun syncAcceptedCount(eventId: Long) {
         jdbcTemplate.update(

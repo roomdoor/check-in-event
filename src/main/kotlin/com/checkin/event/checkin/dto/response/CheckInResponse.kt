@@ -5,8 +5,12 @@ import java.time.LocalDateTime
 
 @Schema(description = "체크인 응답")
 data class CheckInResponse(
-    @Schema(description = "체크인 식별자", example = "1")
-    val id: Long,
+    @Schema(
+        description = "체크인 식별자. 거절된 경우 저장하지 않으므로 null 이다.",
+        example = "1",
+        nullable = true,
+    )
+    val id: Long?,
     @Schema(description = "이벤트 식별자", example = "8")
     val eventId: Long,
     @Schema(description = "참가자 키", example = "user-1-100-1700000000000")

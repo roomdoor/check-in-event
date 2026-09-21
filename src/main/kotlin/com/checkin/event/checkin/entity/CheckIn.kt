@@ -25,8 +25,8 @@ import java.time.LocalDateTime
     ],
     // 승인 인원 집계(CheckInBatchRepository.syncAcceptedCount)가 덮는 인덱스로
     // 끝나게 한다. 유니크 인덱스는 accepted 를 안 담고 있어서, 그것만으로는
-    // 이벤트의 모든 행을 클러스터 인덱스에서 다시 읽어야 한다. 거절도 전부
-    // 행으로 남기 때문에 한 이벤트에 수십만 행이 쌓인다.
+    // 이벤트의 모든 행을 클러스터 인덱스에서 다시 읽어야 한다. 그 집계가
+    // 배치마다 돌기 때문에 정원이 큰 이벤트에서 드레인 시간에 직접 얹힌다.
     indexes = [
         Index(name = "idx_checkins_event_accepted", columnList = "event_id, accepted"),
     ],

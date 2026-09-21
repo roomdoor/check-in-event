@@ -219,17 +219,23 @@ k6_reqs=0
 k6_dropped=0
 k6_p95=0
 k6_dup_sent=0
+k6_rejected=0
 if [ -f "${run_dir}/summary.json" ]; then
   k6_reqs="$(jq -r '.metrics.http_reqs.count // 0' "${run_dir}/summary.json")" || k6_reqs=0
   k6_dropped="$(jq -r '.metrics.dropped_iterations.count // 0' "${run_dir}/summary.json")" || k6_dropped=0
   k6_p95="$(jq -r '.metrics.http_req_duration["p(95)"] // 0' "${run_dir}/summary.json")" || k6_p95=0
   k6_dup_sent="$(jq -r '.metrics.checkin_duplicate_sent.count // 0' "${run_dir}/summary.json")" || k6_dup_sent=0
+  # 거절은 더 이상 DB 에 안 남는다(응답으로만 알린다). 그래서 거절 건수는
+  # k6 쪽에서 가져와야 한다 — 안 그러면 결과 파일이 "거절 0건" 으로 보여
+  # 부하가 안 걸린 것처럼 읽힌다.
+  k6_rejected="$(jq -r '.metrics.checkin_rejected.count // 0' "${run_dir}/summary.json")" || k6_rejected=0
 else
   echo "k6 요약 파일이 없다. 부하 지표 없이 저장소 집계만 한다." >&2
 fi
 case "${k6_reqs}" in ''|*[!0-9]*) k6_reqs=0 ;; esac
 case "${k6_dropped}" in ''|*[!0-9]*) k6_dropped=0 ;; esac
 case "${k6_dup_sent}" in ''|*[!0-9]*) k6_dup_sent=0 ;; esac
+case "${k6_rejected}" in ''|*[!0-9]*) k6_rejected=0 ;; esac
 
 # 불변식. 하나라도 깨지면 이 회차는 성능 이전에 정확성이 틀린 것이다.
 violations=""
@@ -311,7 +317,7 @@ jq -n \
   --argjson drain_seconds "${drain_seconds}" --argjson drain_capped "${drain_capped}" \
   --argjson writer_batch "${WRITER_BATCH_SIZE}" --argjson writer_delay "${WRITER_DELAY_MS}" \
   --argjson k6_reqs "${k6_reqs}" --argjson k6_dropped "${k6_dropped}" --argjson k6_p95 "${k6_p95}" \
-  --argjson k6_dup_sent "${k6_dup_sent}" \
+  --argjson k6_dup_sent "${k6_dup_sent}" --argjson k6_rejected "${k6_rejected}" \
   '{run_id:$run_id, mode:$mode, started_at:$started_at, event_id:$event_id,
     load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
@@ -320,13 +326,14 @@ jq -n \
     redis:{count:$redis_count, users:$redis_users, pos:$redis_pos, stream_len:$stream_len},
     drain:{seconds:$drain_seconds, capped:$drain_capped},
     k6:{requests:$k6_reqs, dropped_iterations:$k6_dropped, p95_ms:$k6_p95,
-        duplicate_sent:$k6_dup_sent},
+        duplicate_sent:$k6_dup_sent, rejected:$k6_rejected},
     violations:$violations}' > "${run_dir}/result.json"
 
 echo
 echo "==== ${run_id} ===="
 echo "정원 ${evt_capacity} / 승인 ${evt_accepted}"
-echo "DB   승인 ${db_accepted} · 거부 ${db_rejected} · 합계 ${db_total} · 중복키 ${db_dup_keys}"
+echo "DB   승인 ${db_accepted} · 합계 ${db_total} · 중복키 ${db_dup_keys}"
+echo "     (거절은 저장하지 않는다. k6 가 센 거절 ${k6_rejected}건)"
 [ "${MODE}" = "db" ] || echo "Redis count ${redis_count} · users ${redis_users} · pos ${redis_pos} · 스트림 누적 ${stream_len}(XTRIM 미적용)"
 [ "${MODE}" = "db" ] || echo "드레인 ${drain_seconds}s (상한초과=${drain_capped})"
 echo "k6   요청 ${k6_reqs} · 버려진 이터레이션 ${k6_dropped} · 재사용 ${k6_dup_sent} · p95 ${k6_p95}ms"
