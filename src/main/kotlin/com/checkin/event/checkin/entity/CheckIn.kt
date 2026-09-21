@@ -6,6 +6,7 @@ import jakarta.persistence.FetchType
 import jakarta.persistence.GeneratedValue
 import jakarta.persistence.GenerationType
 import jakarta.persistence.Id
+import jakarta.persistence.Index
 import jakarta.persistence.JoinColumn
 import jakarta.persistence.ManyToOne
 import jakarta.persistence.Table
@@ -21,6 +22,13 @@ import java.time.LocalDateTime
             name = "uk_checkins_event_participant",
             columnNames = ["event_id", "participant_key"],
         ),
+    ],
+    // 승인 인원 집계(CheckInBatchRepository.syncAcceptedCount)가 덮는 인덱스로
+    // 끝나게 한다. 유니크 인덱스는 accepted 를 안 담고 있어서, 그것만으로는
+    // 이벤트의 모든 행을 클러스터 인덱스에서 다시 읽어야 한다. 거절도 전부
+    // 행으로 남기 때문에 한 이벤트에 수십만 행이 쌓인다.
+    indexes = [
+        Index(name = "idx_checkins_event_accepted", columnList = "event_id, accepted"),
     ],
 )
 class CheckIn(
