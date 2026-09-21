@@ -42,24 +42,33 @@ export const options = {
   },
 };
 
-// 모듈 스코프는 VU마다 따로 잡힌다. 이미 보낸 키를 들고 있다가 재사용한다.
-let sentKeys = [];
+// 모듈 스코프는 VU마다 따로 잡힌다. 승인된 키만 들고 있다가 재사용한다.
+//
+// 거부된 키를 넣으면 안 된다. 거부자는 event:{id}:users 집합에 안 들어가므로,
+// 다시 보내도 Lua 의 SISMEMBER 중복 분기가 아니라 정원초과 분기를 탄다.
+// 정원보다 부하가 훨씬 큰 회차에서는 거의 전부가 거부라, 중복을 보낸다고
+// 믿으면서 실제로는 중복 경로를 한 번도 안 건드리게 된다.
+let acceptedKeys = [];
 
 function nextKey() {
-  if (DUP_RATIO > 0 && sentKeys.length > 0 && Math.random() < DUP_RATIO) {
+  if (DUP_RATIO > 0 && acceptedKeys.length > 0 && Math.random() < DUP_RATIO) {
     dupSentCounter.add(1);
-    return sentKeys[Math.floor(Math.random() * sentKeys.length)];
+    return acceptedKeys[Math.floor(Math.random() * acceptedKeys.length)];
   }
-  const key = `${KEY_PREFIX}-${__VU}-${__ITER}`;
+  return `${KEY_PREFIX}-${__VU}-${__ITER}`;
+}
+
+function rememberIfAccepted(key, body) {
   // 재사용 후보가 무한정 늘지 않게 앞쪽만 남긴다.
-  if (sentKeys.length < 1000) {
-    sentKeys.push(key);
-  }
-  return key;
+  if (acceptedKeys.length >= 1000) return;
+  if (!body || body.result !== "ACCEPTED") return;
+  if (body.duplicate === true) return;
+  acceptedKeys.push(key);
 }
 
 export default function () {
-  const payload = JSON.stringify({ participantKey: nextKey() });
+  const key = nextKey();
+  const payload = JSON.stringify({ participantKey: key });
 
   const res = http.post(`${BASE_URL}${PATH}`, payload, {
     headers: { "Content-Type": "application/json" },
@@ -71,19 +80,24 @@ export default function () {
 
   if (res.status !== 200) {
     errorCounter.add(1);
-  } else {
-    // db 모드는 중복이어도 저장된 원래 행을 그대로 돌려준다 —
-    // 응답만으로는 신규와 구분되지 않는다. duplicate 필드는 redis 모드에만 있다.
-    const body = res.json();
-    if (body && body.result === "ACCEPTED") {
-      acceptedCounter.add(1);
-    } else if (body && body.result === "REJECTED") {
-      rejectedCounter.add(1);
-    }
-    if (body && body.duplicate === true) {
-      duplicateCounter.add(1);
-    }
+    sleep(SLEEP);
+    return;
   }
 
+  // db 모드는 중복이어도 저장된 원래 행을 그대로 돌려준다 —
+  // 응답만으로는 신규와 구분되지 않는다. duplicate 필드는 redis 모드에만 있다.
+  const body = res.json();
+  if (body && body.duplicate === true) {
+    // redis 모드는 중복에도 result=ACCEPTED 를 준다(CheckInRedisStore 가
+    // accepted = 승인 or 중복). 여기서 걸러내지 않으면 같은 사람을 여러 번
+    // 승인으로 세어, 정원 1만짜리에서 승인 4만 같은 숫자가 나온다.
+    duplicateCounter.add(1);
+  } else if (body && body.result === "ACCEPTED") {
+    acceptedCounter.add(1);
+  } else if (body && body.result === "REJECTED") {
+    rejectedCounter.add(1);
+  }
+
+  rememberIfAccepted(key, body);
   sleep(SLEEP);
 }

@@ -28,18 +28,39 @@ MYSQL_DATABASE="${MYSQL_DATABASE:-checkin_event}"
 # 호스트에 클라이언트가 없으면 컴포즈 컨테이너 안의 것을 쓴다.
 # 원격(EC2 등)을 볼 때는 통째로 덮어쓰면 된다.
 #   REDIS_CLI="redis-cli -h 10.0.1.5"
+#
+# 폴백은 컨테이너 안에서 도는 클라이언트라 REDIS_HOST/MYSQL_HOST 를 못 쓴다.
+# 원격 주소를 준 채로 폴백에 걸리면 k6 는 원격을 때리고 초기화·집계는 로컬을
+# 건드려서, 로컬의 0 과 원격 트래픽을 비교한 뒤 자신 있게 틀린 답을 낸다.
+# 그래서 조용히 넘어가지 않고 여기서 멈춘다.
+is_local_host() {
+  case "$1" in
+    localhost|127.0.0.1|::1|'') return 0 ;;
+    *) return 1 ;;
+  esac
+}
 if [ -z "${REDIS_CLI:-}" ]; then
   if command -v redis-cli >/dev/null; then
     REDIS_CLI="redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT}"
-  else
+  elif is_local_host "${REDIS_HOST}"; then
     REDIS_CLI="docker exec -i ${REDIS_CONTAINER:-checkin-redis} redis-cli"
+  else
+    echo "REDIS_HOST=${REDIS_HOST} 를 줬는데 이 호스트에 redis-cli 가 없다." >&2
+    echo "docker 폴백은 컨테이너 안을 보므로 그 주소로 못 간다." >&2
+    echo "redis-cli 를 설치하거나 REDIS_CLI 를 직접 지정할 것." >&2
+    exit 1
   fi
 fi
 if [ -z "${MYSQL_CLI:-}" ]; then
   if command -v mysql >/dev/null; then
     MYSQL_CLI="mysql -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} -p${MYSQL_PASSWORD}"
-  else
+  elif is_local_host "${MYSQL_HOST}"; then
     MYSQL_CLI="docker exec -i ${MYSQL_CONTAINER:-checkin-mysql} mysql -u${MYSQL_USER} -p${MYSQL_PASSWORD}"
+  else
+    echo "MYSQL_HOST=${MYSQL_HOST} 를 줬는데 이 호스트에 mysql 클라이언트가 없다." >&2
+    echo "docker 폴백은 컨테이너 안을 보므로 그 주소로 못 간다." >&2
+    echo "mysql 클라이언트를 설치하거나 MYSQL_CLI 를 직접 지정할 것." >&2
+    exit 1
   fi
 fi
 
@@ -64,6 +85,12 @@ case "${RATE}" in
 esac
 case "${CAPACITY}" in
   ''|*[!0-9]*) echo "CAPACITY 는 정수여야 한다. 받은 값: '${CAPACITY}'" >&2; exit 1 ;;
+esac
+# DUP_RATIO 는 0~1 의 소수다. 검증을 빼면 'abc' 가 NaN 이 되어 중복이 조용히
+# 꺼진 채로 돌고, 회차는 성공으로 끝난다 — 엉뚱한 걸 재고 통과하는 셈이다.
+case "${DUP_RATIO}" in
+  0|1|0.[0-9]|0.[0-9][0-9]) ;;
+  *) echo "DUP_RATIO 는 0 이상 1 이하여야 한다(예: 0, 0.1, 0.25, 1). 받은 값: '${DUP_RATIO}'" >&2; exit 1 ;;
 esac
 
 command -v k6 >/dev/null || { echo "k6 가 없다." >&2; exit 1; }
@@ -95,7 +122,11 @@ echo "    event_id=${EVENT_ID}"
 echo "==> 상태 초기화"
 redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT_ID}:pos" \
   checkins:stream checkins:stream:offset >/dev/null
+# 행만 지우고 events.accepted_count 를 두면 지난 이벤트들이 "행은 없는데
+# 참가자는 있다"는 상태로 남아 조회 API가 영구히 틀린 잔여 정원을 답한다.
+# 둘을 같이 되돌린다.
 mysql_query "DELETE FROM check_ins;" >/dev/null
+mysql_query "UPDATE events SET accepted_count = 0;" >/dev/null
 
 run_id="${MODE}-rate${RATE}-dup${DUP_RATIO}-$(date +%Y%m%d-%H%M%S)"
 run_dir="${RESULTS_ROOT}/${run_id}"
@@ -147,11 +178,29 @@ $(mysql_query "SELECT
  (SELECT capacity FROM events WHERE id=${EVENT_ID});")
 EOF
 
+# 이벤트 행이 사라졌거나 쿼리가 실패하면 mysql 이 NULL 이나 빈 값을 뱉는다.
+# 그대로 두면 [ NULL -le 0 ] 이 깨지고, 마지막 jq 의 --argjson 이 NULL 을
+# 못 받아 결과 파일을 쓰기 직전에 회차 전체가 날아간다.
+sql_read_failed=false
+for _var in db_accepted db_rejected db_total db_dup_keys evt_accepted evt_capacity; do
+  eval "_val=\${${_var}:-}"
+  case "${_val}" in
+    ''|*[!0-9]*) eval "${_var}=0"; sql_read_failed=true ;;
+  esac
+done
+
 redis_count="$(redis_cmd GET "event:${EVENT_ID}:count")"
 redis_users="$(redis_cmd SCARD "event:${EVENT_ID}:users")"
 redis_pos="$(redis_cmd HLEN "event:${EVENT_ID}:pos")"
 stream_len="$(redis_cmd XLEN checkins:stream)"
-: "${redis_count:=0}"
+# GET 은 키가 없으면 빈 값을 준다. 나머지도 명령이 실패하면 비어 있을 수 있어
+# 같은 이유(비교 깨짐, jq --argjson 실패)로 숫자로 맞춰둔다.
+for _var in redis_count redis_users redis_pos stream_len; do
+  eval "_val=\${${_var}:-}"
+  case "${_val}" in
+    ''|*[!0-9]*) eval "${_var}=0" ;;
+  esac
+done
 
 # k6 가 요약을 못 남기고 죽는 경우가 있다(스크립트 오류, 대상 불통, OOM).
 # 그때 jq 를 그냥 부르면 set -e 로 여기서 스크립트가 끝나 버려서, 아래
@@ -175,6 +224,8 @@ violations=""
 # 아무 일도 안 일어난 회차부터 걸러야 한다. 나머지 검사는 전부 "같은가" 를
 # 보기 때문에 0 끼리 비교하면 저절로 참이 된다. 앱이 체크인마다 500을 뱉어도
 # 저장이 0건이라 모든 검사를 통과하고 "위반 없음" 이 나온다. 실제로 그랬다.
+[ "${sql_read_failed}" = false ] \
+  || violations="${violations} 집계실패(DB 에서 숫자를 못 읽음)"
 [ "${k6_reqs}" -gt 0 ] \
   || violations="${violations} 부하없음(k6 요청 0건)"
 if [ "${k6_reqs}" -gt 0 ] && [ "${db_total:-0}" -eq 0 ]; then
@@ -188,10 +239,17 @@ fi
 
 [ "${evt_accepted:-0}" -le "${evt_capacity:-0}" ] \
   || violations="${violations} 초과승인(accepted_count=${evt_accepted} > capacity=${evt_capacity})"
+# 스키마 점검에 가깝다. 두 경로 모두 중복 행을 물리적으로 못 만든다
+# (db 모드는 유니크 제약, redis 모드는 insert ignore). 유니크 인덱스가
+# 사라진 경우에만 걸린다 — 동시 중복 차단이 되는지를 보는 검사가 아니다.
 [ "${db_dup_keys:-0}" -eq 0 ] \
   || violations="${violations} 중복행(${db_dup_keys}개 키)"
 # events.accepted_count 는 조회 API가 remaining 을 계산하는 근거다.
 # 실제 승인 행 수와 어긋나면 API가 거짓말을 한다.
+#
+# 주의: 이슈 #1 이 고쳐지기 전까지 redis 모드는 이 검사에서 항상 걸린다.
+# 스크립트 문제가 아니라 드러난 앱 결함이다(rewriteBatchedStatements=true 라
+# 배치 반환값이 -2 로 와서 카운터가 한 번도 안 오른다).
 [ "${evt_accepted:-0}" -eq "${db_accepted:-0}" ] \
   || violations="${violations} 카운터불일치(accepted_count=${evt_accepted} vs 승인행=${db_accepted})"
 if [ "${MODE}" = "redis" ] && [ "${drain_capped}" = false ]; then
