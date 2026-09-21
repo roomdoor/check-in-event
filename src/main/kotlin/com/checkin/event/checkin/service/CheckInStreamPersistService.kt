@@ -41,15 +41,14 @@ class CheckInStreamPersistService(
 
         if (rows.isEmpty()) return true
 
-        val inserted = checkInBatchRepository.insertIgnore(rows)
-        val acceptedIncrements = mutableMapOf<Long, Int>()
-        rows.forEachIndexed { index, row ->
-            if (inserted.getOrNull(index)?.let { it > 0 } == true && row.accepted) {
-                acceptedIncrements[row.eventId] = (acceptedIncrements[row.eventId] ?: 0) + 1
-            }
-        }
-        acceptedIncrements.forEach { (eventId, count) ->
-            eventRepository.incrementAcceptedCountBy(eventId, count)
+        checkInBatchRepository.insertIgnore(rows)
+
+        // 배치 반환값으로 "몇 건 들어갔나"를 셀 수 없다(insertIgnore 주석 참고).
+        // 늘리는 대신 실제 저장된 행을 세서 덮어쓴다. 같은 트랜잭션이라 방금
+        // 넣은 행이 보이고, 재처리로 같은 배치가 두 번 와도 결과가 같다.
+        // 과거에 어긋나 있던 값도 다음 배치에서 저절로 맞춰진다.
+        rows.map { it.eventId }.distinct().forEach { eventId ->
+            eventRepository.setAcceptedCount(eventId, checkInBatchRepository.countAccepted(eventId))
         }
 
         return true
