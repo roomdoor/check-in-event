@@ -59,10 +59,17 @@ output "next_steps" {
        DEST 를 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을 허용한다 —
        로컬 회차와 섞이면 나중에 어느 쪽 수치였는지 알 수 없다.
 
+       REMOTE_RESULTS 는 이번에 돌린 것만 가리킬 것. results 디렉터리를
+       통째로 주면 안 된다 — 저장소에 커밋된 지난 결과가 clone 을 타고
+       호스트에 가 있어서, 그것까지 다시 올라왔다 내려오며 경로가 중첩된다.
+
+       # 스윕이면 (config 이름이 디렉터리가 된다)
        TF_DIR=infra \
-       REMOTE_RESULTS=/opt/check-in-event/loadtest/results \
-       DEST=./loadtest/results/ec2 \
+       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/drainer \
+       DEST=./loadtest/results/ec2/drainer \
          <k6-bench-kit>/scripts/fetch-results.sh
+
+       # 단발 회차면 run.sh 가 찍어준 경로를 그대로
 
     4) 커밋한 뒤
        terraform -chdir=infra destroy
