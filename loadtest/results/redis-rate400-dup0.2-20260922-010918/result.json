@@ -1,0 +1,43 @@
+{
+  "run_id": "redis-rate400-dup0.2-20260922-010918",
+  "mode": "redis",
+  "started_at": "2026-09-22T01:09:18Z",
+  "event_id": 1,
+  "load": {
+    "rate": 400,
+    "duration": "30s",
+    "dup_ratio": "0.2"
+  },
+  "writer": {
+    "batch_size": 200,
+    "delay_ms": 500
+  },
+  "event": {
+    "capacity": 2000,
+    "accepted_count": 2000
+  },
+  "db": {
+    "accepted": 2000,
+    "rejected": 0,
+    "total": 2000,
+    "duplicate_keys": 0
+  },
+  "redis": {
+    "count": 2000,
+    "users": 2000,
+    "pos": 2000,
+    "stream_len": 2000
+  },
+  "drain": {
+    "seconds": 0,
+    "capped": false
+  },
+  "k6": {
+    "requests": 12000,
+    "dropped_iterations": 0,
+    "p95_ms": 7.12084365,
+    "duplicate_sent": 2365,
+    "rejected": 7635
+  },
+  "violations": "none"
+}

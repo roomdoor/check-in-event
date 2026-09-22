@@ -17,5 +17,13 @@ out/
 # Local tooling
 .sisyphus/
 
-# 로드테스트 결과 (로컬 회차는 커밋하지 않는다)
-loadtest/results/
+# 로드테스트 결과.
+#
+# 로컬 회차는 커밋하지 않는다 — 앱·MySQL·Redis·k6 가 한 머신에 있으면 무엇이
+# 병목인지 구분되지 않아 수치로 쓸 수 없다. 하네스가 도는지 보는 용도다.
+#
+# EC2 3호스트 회차는 커밋한다. 조건이 result.json 에 같이 남으므로 나중에
+# 무엇을 어떤 설정에서 쟀는지 추적된다.
+loadtest/results/*
+!loadtest/results/*/
+!loadtest/results/*/*.json
