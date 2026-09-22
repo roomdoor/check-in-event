@@ -1,0 +1,84 @@
+#!/bin/bash
+# B 호스트 — MySQL + Redis.
+#
+# 앱과 같은 호스트에 두지 않는다. 저장이 CPU 를 먹으면 앱의 처리량이 떨어지고,
+# 그러면 "앱이 느린가 DB 가 느린가" 가 구분되지 않는다.
+#
+# docker-compose.yml 과 같은 이미지·같은 서버 옵션을 쓴다. 로컬에서 재던 것과
+# 조건을 맞춰야 로컬 결과를 참고값으로라도 쓸 수 있다. 다른 점은 포트를
+# 0.0.0.0 에 여는 것 하나다 — A 와 C 가 붙어야 한다. 보안 그룹이 그 둘만 통과시킨다.
+set -euxo pipefail
+exec > >(tee /var/log/bench-bootstrap.log) 2>&1
+
+dnf install -y docker
+systemctl enable --now docker
+
+# sysctl -w 는 재부팅하면 사라진다. 측정 사이에 인스턴스를 stop/start 하는 일이
+# 흔한데 그때 조건이 조용히 달라지면 회차 간 비교가 깨진다.
+cat > /etc/sysctl.d/99-bench.conf <<'SYSCTL'
+net.core.somaxconn = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+fs.file-max = 2097152
+SYSCTL
+sysctl --system
+
+# 비밀번호는 SSM 에서 받는다. user-data 에 박으면 IMDS 로 인스턴스의 모든
+# 프로세스가 읽는다.
+#
+# set +x 로 감싼다. 안 그러면 -x 추적 출력에 비밀번호가 찍히고 그 로그가
+# /var/log/bench-bootstrap.log 에 남는다.
+set +x
+DB_PASSWORD="$(aws ssm get-parameter --region "${region}" \
+  --name "${db_param}" --with-decryption \
+  --query 'Parameter.Value' --output text)"
+
+# docker run -e 로 넘기지 않는다. ps 와 docker inspect 에 남는다.
+umask 077
+cat > /etc/bench-db.env <<ENVFILE
+MYSQL_ROOT_PASSWORD=$${DB_PASSWORD}
+MYSQL_DATABASE=${db_name}
+ENVFILE
+set -x
+
+# 컨테이너 이름은 로컬 compose 와 같게 둔다. loadtest/run.sh 가 클라이언트를
+# 못 찾으면 docker exec 폴백으로 이 이름을 쓴다.
+docker run -d --name checkin-mysql --restart unless-stopped \
+  --env-file /etc/bench-db.env \
+  -p 3306:3306 \
+  -v /var/lib/bench-mysql:/var/lib/mysql \
+  mysql:8.0 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_unicode_ci \
+  --default-time-zone=+09:00
+
+# appendonly 는 compose 와 같게 켠다. 끄면 디스크 쓰기가 사라져 Redis 쪽이
+# 실제보다 빠르게 나온다 — 비교가 한쪽으로 기운다.
+docker run -d --name checkin-redis --restart unless-stopped \
+  -p 6379:6379 \
+  -v /var/lib/bench-redis:/data \
+  redis:7.2 \
+  redis-server --appendonly yes --maxmemory-policy noeviction
+
+# 둘 다 뜰 때까지 기다린다. 준비 마커는 그 뒤에 만든다 — A 호스트가 이걸
+# 기다리지는 않지만, 마커가 없으면 사람이 무엇이 덜 됐는지 바로 안다.
+for _ in $(seq 1 60); do
+  if docker exec checkin-mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -uroot --silent' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+docker exec checkin-mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -uroot --silent' \
+  || { echo "MySQL 이 준비되지 않았다" >&2; docker logs --tail 50 checkin-mysql >&2; exit 1; }
+
+for _ in $(seq 1 30); do
+  if docker exec checkin-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+    break
+  fi
+  sleep 2
+done
+docker exec checkin-redis redis-cli ping | grep -q PONG \
+  || { echo "Redis 가 준비되지 않았다" >&2; docker logs --tail 50 checkin-redis >&2; exit 1; }
+
+touch /var/lib/bench-ready
+echo "deps host ready: mysql 3306, redis 6379"

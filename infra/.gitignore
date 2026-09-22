@@ -1,0 +1,21 @@
+# state에는 random_password로 만든 DB 비밀번호가 평문으로 들어간다.
+# 절대 커밋하지 않는다.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# 저장된 실행 계획. state 와 마찬가지로 생성된 DB 비밀번호가 들어간다.
+tfplan
+tfplan-*
+*.tfplan
+
+# 프로바이더 바이너리. 수백 MB다.
+.terraform/
+
+# 로컬 변수 오버라이드
+*.tfvars
+*.auto.tfvars
+override.tf
+override_*.tf
+
+# .terraform.lock.hcl 은 의도적으로 커밋한다 — 프로바이더 버전을 고정한다.
