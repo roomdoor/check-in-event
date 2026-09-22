@@ -1,0 +1,50 @@
+{
+  "run_id": "db-rate200-dup0.1-20260922-055912",
+  "mode": "db",
+  "started_at": "2026-09-22T05:59:12Z",
+  "event_id": 2,
+  "where": {
+    "base_url": "http://10.0.1.13:8080",
+    "redis_host": "10.0.1.114",
+    "mysql_host": "10.0.1.114"
+  },
+  "load": {
+    "rate": 200,
+    "duration": "1m",
+    "dup_ratio": "0.1",
+    "pre_vus": 50,
+    "max_vus": 2000
+  },
+  "writer": {
+    "batch_size": 1600,
+    "delay_ms": 100
+  },
+  "event": {
+    "capacity": 200000,
+    "accepted_count": 10619
+  },
+  "db": {
+    "accepted": 10619,
+    "rejected": 0,
+    "total": 10619,
+    "duplicate_keys": 0
+  },
+  "redis": {
+    "count": 0,
+    "users": 0,
+    "pos": 0,
+    "stream_len": 0
+  },
+  "drain": {
+    "seconds": 0,
+    "capped": false
+  },
+  "k6": {
+    "requests": 11799,
+    "dropped_iterations": 201,
+    "p95_ms": 1251.0212403,
+    "duplicate_sent": 1180,
+    "rejected": 0
+  },
+  "violations": "none"
+}
