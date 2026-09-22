@@ -39,6 +39,13 @@ DURATION="${DURATION:-1m}"
 CAPACITY="${CAPACITY:-10000}"
 DUP_RATIO="${DUP_RATIO:-0}"
 
+# 본 측정 전에 흘려보낼 부하의 길이. 0 이면 끈다.
+#
+# 30s 는 6400 RPS 에서 약 19만 요청이고, 그 정도면 p95 가 2ms 대로 내려온다.
+# 낮은 rate 에서는 요청 수가 적어 덜 데워지지만, 낮은 rate 는 콜드여도
+# 버티므로 문제가 안 된다. 회차마다 그만큼 길어진다는 것만 감안하면 된다.
+WARMUP_DURATION="${WARMUP_DURATION:-30s}"
+
 # 앱을 재기동할 대상. 부트스트랩이 /etc/profile.d/bench.sh 에 심어둔다.
 SUT_INSTANCE_ID="${SUT_INSTANCE_ID:?SUT_INSTANCE_ID 가 필요하다. /etc/profile.d/bench.sh 를 source 했는지 확인할 것}"
 AWS_REGION="${AWS_REGION:?AWS_REGION 이 필요하다}"
@@ -47,6 +54,11 @@ APP_START_TIMEOUT="${APP_START_TIMEOUT:-600}"
 
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRIPT_DIR}/results}"
 SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
+
+# 워밍업 회차가 결과를 쓰는 자리. SWEEP_ROOT 밖에 둔다 — 안에 두면 끝에
+# 표를 만들 때 같이 세어지고, S3 로도 올라간다.
+warmup_root="${RESULTS_ROOT}/.warmup"
+mkdir -p "${warmup_root}"
 
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
@@ -67,6 +79,12 @@ fi
 case "${DURATION}" in
   *[0-9]s|*[0-9]m|*[0-9]h) ;;
   *) echo "DURATION 은 30s, 1m, 1h 형태여야 한다. 받은 값: '${DURATION}'" >&2; exit 1 ;;
+esac
+# 워밍업도 같은 형태여야 한다. 여기서 안 걸러도 워밍업은 실패를 무시하므로,
+# 잘못된 값이면 데우지 않은 채 조용히 모든 회차를 콜드로 잰다.
+case "${WARMUP_DURATION}" in
+  0|*[0-9]s|*[0-9]m|*[0-9]h) ;;
+  *) echo "WARMUP_DURATION 은 0 또는 30s, 1m 형태여야 한다. 받은 값: '${WARMUP_DURATION}'" >&2; exit 1 ;;
 esac
 for _list_name in RATES WRITER_BATCH_SIZES WRITER_DELAYS; do
   eval "_list=\${${_list_name}}"
@@ -203,6 +221,28 @@ for mode in ${MODES}; do
     [ -z "${DRAIN_POLL_SECONDS:-}" ] || round_env+=("DRAIN_POLL_SECONDS=${DRAIN_POLL_SECONDS}")
     [ -z "${PRE_VUS:-}" ]            || round_env+=("PRE_VUS=${PRE_VUS}")
     [ -z "${MAX_VUS:-}" ]            || round_env+=("MAX_VUS=${MAX_VUS}")
+
+    # 재기동한 앱은 데우고 잰다.
+    #
+    # JVM 은 코드를 해석하다가 자주 도는 부분만 기계어로 컴파일하고, 클래스도
+    # 처음 쓸 때 로딩한다. 이 서비스는 응답이 밀리초 단위라 그 비용이 측정값보다
+    # 크다 — 같은 6400 RPS 가 따뜻하면 p95 2.15ms, 재기동 직후면 1474ms 였다.
+    # 회차마다 재기동하므로, 데우지 않으면 매 회차가 그 1474ms 쪽을 잰다.
+    #
+    # run.sh 를 짧게 한 번 더 돌린다. 상태 초기화와 이벤트 생성이 그 안에 있고,
+    # 본 회차가 어차피 다시 비우므로 워밍업이 남긴 행은 섞이지 않는다.
+    # 결과는 버린다 — 불변식이 깨져도 워밍업 회차의 일이라 무시한다.
+    #
+    # 콜드 상태를 일부러 재려면 WARMUP_DURATION=0 으로 끈다. 배포나
+    # 스케일아웃 중에 피크가 오는 상황이 그쪽이다.
+    if [ "${WARMUP_DURATION}" != "0" ]; then
+      echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
+      env "${round_env[@]}" \
+        "DURATION=${WARMUP_DURATION}" \
+        "RESULTS_ROOT=${warmup_root}" \
+        "${SCRIPT_DIR}/run.sh" >/dev/null 2>&1 || true
+      rm -rf "${warmup_root:?}"/*
+    fi
 
     round_status=0
     env "${round_env[@]}" "${SCRIPT_DIR}/run.sh" || round_status=$?
