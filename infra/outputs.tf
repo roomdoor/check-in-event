@@ -56,20 +56,32 @@ output "next_steps" {
 
     3) 결과 회수 (로컬에서, destroy 전에 반드시)
 
-       DEST 를 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을 허용한다 —
-       로컬 회차와 섞이면 나중에 어느 쪽 수치였는지 알 수 없다.
+       받는 경로는 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을
+       허용한다 — 로컬 회차와 섞이면 어느 쪽 수치였는지 알 수 없다.
 
-       REMOTE_RESULTS 는 이번에 돌린 것만 가리킬 것. results 디렉터리를
-       통째로 주면 안 된다 — 저장소에 커밋된 지난 결과가 clone 을 타고
-       호스트에 가 있어서, 그것까지 다시 올라왔다 내려오며 경로가 중첩된다.
+       스윕과 단발 회차는 받는 방법이 다르다. sweep.sh 는 끝에 자기 결과를
+       s3://<버킷>/results/<config 이름>/ 으로 이미 올린다. 그러니 스윕은
+       내려받기만 하면 된다.
 
-       # 스윕이면 (config 이름이 디렉터리가 된다)
+       여기에 fetch-results.sh 를 쓰면 안 된다. 그 스크립트는 호스트에서
+       S3 로 올리는 단계부터 하는데, 올리는 자리가 results/ 바로 아래라
+       sweep.sh 가 넣어둔 것과 겹친다. 같은 회차가 results/<run_id>/ 와
+       results/<config>/<run_id>/ 양쪽에 생겨 두 번 커밋되고, 버킷에 남아
+       있던 지난 스윕까지 딸려 내려온다.
+
+       # 스윕이면 — 버킷에서 바로 내려받는다
+       BUCKET="$(terraform -chdir=infra output -raw results_bucket)"
+       aws s3 sync "s3://$BUCKET/results/compare/" ./loadtest/results/ec2/compare/
+
+       # 단발 회차면 fetch-results.sh 를 쓴다. run.sh 는 S3 로 올리지 않으므로
+       # 호스트에서 올리는 단계가 필요하다. REMOTE_RESULTS 에는 run.sh 가
+       # 마지막에 찍어준 경로 하나만 줄 것 — results 디렉터리를 통째로 주면
+       # 저장소에 커밋돼 clone 을 타고 호스트에 가 있는 지난 결과까지 다시
+       # 올라왔다 내려오며 경로가 중첩된다.
        TF_DIR=infra \
-       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/drainer \
-       DEST=./loadtest/results/ec2/drainer \
+       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/<run_id> \
+       DEST=./loadtest/results/ec2/<run_id> \
          <k6-bench-kit>/scripts/fetch-results.sh
-
-       # 단발 회차면 run.sh 가 찍어준 경로를 그대로
 
     4) 커밋한 뒤
        terraform -chdir=infra destroy
