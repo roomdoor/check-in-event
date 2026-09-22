@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # 여러 조합을 돌면서 회차마다 앱을 재기동한다. 부하 호스트(C)에서 돌린다.
 #
+#   . /etc/profile.d/bench.sh            # BASE_URL, SUT_INSTANCE_ID, AWS_REGION 등
+#   export REDIS_HOST=<B 호스트 사설 IP>
+#   export MYSQL_HOST=<B 호스트 사설 IP>
+#   export MYSQL_PASSWORD="$(aws ssm get-parameter --region "$AWS_REGION" \
+#     --name /<name_prefix>/db-password --with-decryption \
+#     --query Parameter.Value --output text)"
+#
 #   ./loadtest/sweep.sh loadtest/config/drainer.env
+#
+# 위 셋을 안 주면 run.sh 가 로컬을 보게 되므로 회차마다 거부하고 멈춘다.
+# 정확한 명령은 terraform output next_steps 에 있다.
 #
 # 한 판을 도는 건 run.sh 다. 이 스크립트가 하는 일은 둘뿐이다 —
 # 조합을 돌고, 조합마다 앱을 그 설정으로 다시 띄운다.
@@ -46,6 +56,18 @@ for _name in REPEATS CAPACITY APP_START_TIMEOUT; do
     ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
   esac
 done
+# SSM executionTimeout 의 허용 범위다. 벗어나면 send-command 가 거부하는데,
+# 그 실패가 회차마다 반복되어 스윕 전체가 빈손으로 끝난다.
+if [ "${APP_START_TIMEOUT}" -lt 30 ] || [ "${APP_START_TIMEOUT}" -gt 172800 ]; then
+  echo "APP_START_TIMEOUT 은 30~172800 이어야 한다(SSM 제한). 받은 값: '${APP_START_TIMEOUT}'" >&2
+  exit 1
+fi
+# run.sh 는 DURATION 을 k6 에 그대로 넘기고 검증하지 않는다. '1min' 같은 값이면
+# 회차마다 k6 가 실패하고, 부하 0 인 result.json 만 조합 수만큼 쌓인다.
+case "${DURATION}" in
+  *[0-9]s|*[0-9]m|*[0-9]h) ;;
+  *) echo "DURATION 은 30s, 1m, 1h 형태여야 한다. 받은 값: '${DURATION}'" >&2; exit 1 ;;
+esac
 for _list_name in RATES WRITER_BATCH_SIZES WRITER_DELAYS; do
   eval "_list=\${${_list_name}}"
   for _v in ${_list}; do
@@ -76,14 +98,26 @@ app_restart() {
     '{commands: [($run + " --checkin.redis.writer.batch-size=" + $b + " --checkin.redis.writer.delay=" + $d)],
       executionTimeout: [$t]}')" || return 1
 
+  # stderr 를 삼키지 않는다. 자격증명 만료, 멈춘 SSM 에이전트, 잘못된
+  # 인스턴스 ID 가 전부 "앱을 못 띄웠다" 한 줄로만 보이면, 12회차를 다 돌고
+  # 나서도 무엇이 문제였는지 알 수 없다.
+  local err_file
+  err_file="$(mktemp)"
   cmd_id="$(aws ssm send-command --region "${AWS_REGION}" \
     --instance-ids "${SUT_INSTANCE_ID}" \
     --document-name AWS-RunShellScript \
     --parameters "${params}" \
-    --query 'Command.CommandId' --output text 2>/dev/null)" || return 1
-  [ -n "${cmd_id}" ] && [ "${cmd_id}" != "None" ] || return 1
+    --query 'Command.CommandId' --output text 2>"${err_file}")" || {
+      echo "SSM send-command 실패:" >&2
+      cat "${err_file}" >&2
+      rm -f "${err_file}"
+      return 1
+    }
+  rm -f "${err_file}"
+  [ -n "${cmd_id}" ] && [ "${cmd_id}" != "None" ] || { echo "SSM 명령 ID 를 못 받았다" >&2; return 1; }
 
   local waited=0
+  local status=Pending
   while [ "${waited}" -lt "${APP_START_TIMEOUT}" ]; do
     status="$(aws ssm get-command-invocation --region "${AWS_REGION}" \
       --command-id "${cmd_id}" --instance-id "${SUT_INSTANCE_ID}" \
@@ -111,13 +145,17 @@ mkdir -p "${SWEEP_ROOT}"
 total=0
 failed=0
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# 표를 이 회차 것만 모으는 데 쓴다. find -newermt 는 로컬 시각을 받는다.
+sweep_start_local="$(date '+%Y-%m-%d %H:%M:%S')"
 
 for mode in ${MODES}; do
   # db 모드는 드레이너를 쓰지 않는다. 그 설정으로 스윕하면 같은 측정을
   # 조합 수만큼 반복하면서 EC2 시간만 쓴다.
   if [ "${mode}" = "db" ]; then
-    batch_list="${WRITER_BATCH_SIZES%% *}"
-    delay_list="${WRITER_DELAYS%% *}"
+    # %% 로 자르면 앞에 공백이 있을 때 빈 문자열이 되어 회차가 0이 된다.
+    # set -- 로 단어 분해하면 앞뒤 공백과 무관하다.
+    set -- ${WRITER_BATCH_SIZES}; batch_list="$1"
+    set -- ${WRITER_DELAYS};      delay_list="$1"
   else
     batch_list="${WRITER_BATCH_SIZES}"
     delay_list="${WRITER_DELAYS}"
@@ -143,16 +181,31 @@ for mode in ${MODES}; do
 
     # 회차 하나가 실패해도 스윕은 계속한다. run.sh 는 불변식이 깨지면 1 로
     # 끝나는데, 그건 "이 조합에서 깨졌다" 는 결과이지 스윕의 실패가 아니다.
+    # 설정 파일에서 읽은 나머지 값도 그대로 넘긴다. 안 넘기면 조용히 기본값이
+    # 쓰이는데, 두 개는 결과를 왜곡한다 —
+    #   DRAIN_CAP_SECONDS: 일부러 과부하를 준 회차가 기본 600s 안에 못 빠지면
+    #     드레인미완 으로 실패 처리된다. 그건 재려던 것 자체다.
+    #   MAX_VUS: 부족하면 k6 가 도착률을 못 맞추고 이터레이션을 버린다.
+    #     그러면 "batch 를 키워도 안 늘었다" 가 아니라 부하가 안 간 것이다.
+    # env 로 넘긴다. 명령어 앞 할당 자리에 ${VAR:+NAME=val} 를 쓰면 확장 결과가
+    # 할당이 아니라 명령어로 해석되어 command not found 로 죽는다.
+    round_env=(
+      "RESULTS_ROOT=${SWEEP_ROOT}"
+      "MODE=${mode}"
+      "RATE=${rate}"
+      "DURATION=${DURATION}"
+      "CAPACITY=${CAPACITY}"
+      "DUP_RATIO=${DUP_RATIO}"
+      "WRITER_BATCH_SIZE=${batch}"
+      "WRITER_DELAY_MS=${delay}"
+    )
+    [ -z "${DRAIN_CAP_SECONDS:-}" ]  || round_env+=("DRAIN_CAP_SECONDS=${DRAIN_CAP_SECONDS}")
+    [ -z "${DRAIN_POLL_SECONDS:-}" ] || round_env+=("DRAIN_POLL_SECONDS=${DRAIN_POLL_SECONDS}")
+    [ -z "${PRE_VUS:-}" ]            || round_env+=("PRE_VUS=${PRE_VUS}")
+    [ -z "${MAX_VUS:-}" ]            || round_env+=("MAX_VUS=${MAX_VUS}")
+
     round_status=0
-    RESULTS_ROOT="${SWEEP_ROOT}" \
-    MODE="${mode}" \
-    RATE="${rate}" \
-    DURATION="${DURATION}" \
-    CAPACITY="${CAPACITY}" \
-    DUP_RATIO="${DUP_RATIO}" \
-    WRITER_BATCH_SIZE="${batch}" \
-    WRITER_DELAY_MS="${delay}" \
-      "${SCRIPT_DIR}/run.sh" || round_status=$?
+    env "${round_env[@]}" "${SCRIPT_DIR}/run.sh" || round_status=$?
 
     if [ "${round_status}" -ne 0 ]; then
       echo "회차가 불변식 위반으로 끝났다 (종료코드 ${round_status}): ${label}" >&2
@@ -172,13 +225,19 @@ echo "  ${CONFIG_NAME} — ${total}회차 중 ${failed}회차 위반"
 echo "=============================================================="
 printf '%-6s %6s %6s %6s %8s %8s %8s %8s  %s\n' \
   mode batch delay rate 정원 승인 드레인 p95ms 위반
-find "${SWEEP_ROOT}" -name result.json | sort | while read -r f; do
+# 이 회차 것만 센다. 같은 설정을 다시 돌리면 결과가 같은 디렉터리에 쌓이는데,
+# 그걸 다 세면 위의 총계와 표가 어긋나고 어느 게 이번 것인지 알 수 없다.
+find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/null | sort | while read -r f; do
+  # jq 가 깨진 파일에 실패하면 파이프라인이 0 이 아닌 상태를 내고, set -e 가
+  # 여기서 스크립트를 끝낸다 — 아래 S3 업로드와 결과 경로 출력을 못 보고
+  # 몇 시간짜리 스윕이 빈손으로 끝난다.
   jq -r '[.mode, (.writer.batch_size|tostring), (.writer.delay_ms|tostring),
           (.load.rate|tostring), (.event.capacity|tostring), (.db.accepted|tostring),
           ((.drain.seconds|tostring) + "s"), (.k6.p95_ms|tostring|.[0:7]), .violations]
          | @tsv' "$f" 2>/dev/null \
-    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9}'
-done
+    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9}' \
+    || echo "  (읽을 수 없음: ${f})"
+done || true
 
 if [ -n "${RESULTS_BUCKET:-}" ]; then
   echo

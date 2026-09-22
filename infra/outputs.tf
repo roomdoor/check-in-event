@@ -48,7 +48,11 @@ output "next_steps" {
          --name /${var.name_prefix}/db-password --with-decryption \
          --query 'Parameter.Value' --output text)"
 
+       # 한 판만:
        MODE=redis RATE=400 DURATION=1m CAPACITY=10000 ./loadtest/run.sh
+
+       # 조합 스윕 (앱 재기동까지 알아서 한다):
+       ./loadtest/sweep.sh loadtest/config/drainer.env
 
     3) 결과 회수 (로컬에서, destroy 전에 반드시)
 
