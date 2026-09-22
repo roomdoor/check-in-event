@@ -103,6 +103,21 @@ for _name in DRAIN_CAP_SECONDS DRAIN_POLL_SECONDS WRITER_BATCH_SIZE WRITER_DELAY
   esac
 done
 
+# 워밍업 출처도 같은 이유로 막는다. 둘 다 --argjson 으로 들어가므로,
+# 'yes' 나 '12k' 를 주면 부하와 드레인을 다 끝낸 뒤 마지막 jq 에서 죽고
+# result.json 이 안 남는다. 스윕이 줄 때는 정규화되지만 손으로 돌릴 때가 있다.
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
+case "${WARMUP_REQUESTS}" in
+  ''|*[!0-9]*) echo "WARMUP_REQUESTS 는 정수여야 한다. 받은 값: '${WARMUP_REQUESTS}'" >&2; exit 1 ;;
+esac
+for _name in WARMUP_DRAIN_CAPPED WARMUP_ABOVE_THRESHOLD; do
+  eval "_val=\${${_name}:-false}"
+  case "${_val}" in
+    true|false) eval "${_name}=\${_val}" ;;
+    *) echo "${_name} 은 true 또는 false 여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
+  esac
+done
+
 command -v k6 >/dev/null || { echo "k6 가 없다." >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq 가 없다." >&2; exit 1; }
 
@@ -130,12 +145,54 @@ echo "    event_id=${EVENT_ID}"
 
 # 이벤트를 새로 만들어도 스트림과 오프셋은 전역이라 지난 회차가 남는다.
 echo "==> 상태 초기화"
-redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT_ID}:pos" \
-  checkins:stream checkins:stream:offset >/dev/null
+redis_cmd DEL checkins:stream checkins:stream:offset >/dev/null
+
+# 지난 회차들의 이벤트 키를 거둔다.
+#
+# event:<id>:* 를 EVENT_ID 로 지우는 건 의미가 없다 — 그 ID 는 방금 만든
+# 것이라 아직 키가 없다. 실제로 쌓이는 건 이전 회차들 것이고, Redis 가
+# maxmemory 없이 noeviction 으로 도는 데다 회차마다 워밍업까지 붙어서
+# 승인 수만큼의 SET·HASH 가 계속 남는다. 측정 대상 호스트의 Redis 다.
+#
+# 방금 만든 이벤트의 키까지 지워지지만 아직 비어 있어 무해하다 — Lua 가
+# 첫 승인 때 만든다.
+_stale_keys="$(${REDIS_CLI} --scan --pattern 'event:*' 2>/dev/null | tr '\n' ' ')" || _stale_keys=""
+[ -z "${_stale_keys}" ] || redis_cmd DEL ${_stale_keys} >/dev/null
 # 행만 지우고 events.accepted_count 를 두면 지난 이벤트들이 "행은 없는데
 # 참가자는 있다"는 상태로 남아 조회 API가 영구히 틀린 잔여 정원을 답한다.
 # 둘을 같이 되돌린다.
-mysql_query "DELETE FROM check_ins;" >/dev/null
+#
+# DELETE 가 아니라 TRUNCATE 다. DELETE 는 지운 행마다 undo 를 남기고 InnoDB 가
+# 그걸 백그라운드로 정리하는데, 그 정리가 이번 회차의 드레인 측정과 겹친다.
+# 스윕이 워밍업을 돌리면서 그 양이 커졌다 — ceiling.env 6400 회차면 19만 행이고,
+# 드레이너는 배치마다 check_ins 를 count(*) 한다. 드레이너 처리량이 이 저장소의
+# 측정 대상이라 그 위에 퍼지 부하를 얹으면 안 된다.
+# check_ins 는 events 를 참조하는 쪽이고 이를 참조하는 테이블이 없어 TRUNCATE 가
+# 허용된다(참조당하는 테이블이면 MySQL 이 거부한다).
+#
+# 바꾸면서 생기는 차이 둘을 막아둔다.
+#   - TRUNCATE 는 메타데이터 락을 기다리는데 lock_wait_timeout 기본값이
+#     1년이다. 워밍업 직후라 드레이너가 아직 INSERT 중일 수 있고, 그러면
+#     몇 시간짜리 스윕이 여기서 조용히 선다. 60초로 끊는다.
+#   - TRUNCATE 는 DROP 권한을 요구한다(DELETE 는 DELETE 권한이면 됐다).
+#     MYSQL_USER 를 최소 권한 계정으로 바꾸면 여기서 막힌다.
+# 여기만 stderr 를 살린다. mysql_query 는 stderr 를 버리므로 TRUNCATE 가
+# 실패해도 조용한데, 행 수를 세서 추측하면 원인을 잘못 짚는다 — 락 대기
+# 만료인지 권한 부족인지 MySQL 이 이미 말해준다. 그대로 올린다.
+#
+# 행 수로 판정하지 않는 이유가 하나 더 있다. 워밍업 직후라 드레이너가 아직
+# 배치를 커밋할 수 있고, 그 행들은 워밍업의 event_id 를 달고 있어 이번 회차
+# 집계에 안 들어온다(모든 집계가 event_id 로 거른다). 전역으로 세면 그걸
+# 실패로 보고 멀쩡한 회차를 버린다.
+_truncate_err="$(${MYSQL_CLI} -N -B \
+  -e "SET SESSION lock_wait_timeout = 60; TRUNCATE TABLE check_ins;" \
+  "${MYSQL_DATABASE}" 2>&1 >/dev/null)" || {
+    echo "상태 초기화 실패 — check_ins TRUNCATE:" >&2
+    echo "  ${_truncate_err}" >&2
+    echo "  TRUNCATE 는 DROP 권한을 요구하고(DELETE 는 아니었다), 메타데이터 락을" >&2
+    echo "  기다린다. MYSQL_USER=${MYSQL_USER} 권한과 드레이너 상태를 확인할 것." >&2
+    exit 1
+  }
 mysql_query "UPDATE events SET accepted_count = 0;" >/dev/null
 
 run_id="${MODE}-rate${RATE}-dup${DUP_RATIO}-$(date +%Y%m%d-%H%M%S)"
@@ -309,6 +366,10 @@ jq -n \
   --arg duration "${DURATION}" --arg dup_ratio "${DUP_RATIO}" \
   --arg violations "${violations}" \
   --arg base_url "${BASE_URL}" --arg redis_host "${REDIS_HOST}" --arg mysql_host "${MYSQL_HOST}" \
+  --arg warmed_by "${WARMED_BY:-unknown}" \
+  --argjson warmup_requests "${WARMUP_REQUESTS}" \
+  --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED}" \
+  --argjson warmup_above_threshold "${WARMUP_ABOVE_THRESHOLD}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
@@ -325,7 +386,37 @@ jq -n \
     # 무엇이 병목인지 구분되지 않아 쓸 수 없다. 파일만 보고 알 수 있어야 한다.
     where:{base_url:$base_url, redis_host:$redis_host, mysql_host:$mysql_host},
     load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio,
-          pre_vus:$pre_vus, max_vus:$max_vus},
+          pre_vus:$pre_vus, max_vus:$max_vus,
+          # 이 회차 전에 앱을 데웠는지. 응답이 밀리초 단위라 그 차이가
+          # 측정값보다 크다(README 5 장). 파일만 보고 알 수 있어야 한다.
+          #   "30s"     : 스윕이 그 길이만큼 한 번 데웠다
+          #   "30sx3"   : 요청 수가 모자라 3회 반복했다. 낮은 rate 와 db 모드는
+          #               한 번으로 기준을 못 채워서 이 형태가 흔하다
+          #   "none"    : 스윕이 데우려 했으나 부하가 안 나갔다 = 콜드
+          #   "off"     : 워밍업을 끄고 일부러 콜드를 쟀다
+          #   "unknown" : run.sh 를 손으로 돌렸다. 데웠는지는 돌린 사람만 안다
+          # unknown 을 none 과 합치면 안 된다 — 이 저장소의 유일한 웜 측정이
+          # 손으로 돌린 것이라, 합치면 그게 콜드로 기록된다.
+          warmed_by:$warmed_by,
+          # 길이만으로는 충분히 데워졌는지 알 수 없다. 낮은 rate 에서 30초면
+          # 요청이 몇 천 건뿐이라 C2 컴파일 문턱에 못 미친다. 그래서 실제로
+          # 나간 요청 수와, 그게 설정한 기준을 넘었는지를 같이 남긴다.
+          #
+          # 이름이 'sufficient' 가 아닌 이유가 있다. 그 기준(기본 2만)은
+          # 검증된 값이 아니다 — 이 저장소에서 확인된 웜 상태는 38만 요청
+          # 뒤였고, 37만을 콜드로 받은 회차는 여전히 p95 1,474ms 였다.
+          # 넘었다고 해서 충분하다는 뜻이 아니라 '명백히 모자라지는 않다' 다.
+          #
+          # 웜 회차만 고르려면 warmed_by 만 보면 안 된다 —
+          #   .load.warmed_by as $w | ($w != "off" and $w != "none"
+          #     and $w != "unknown" and .load.warmup_above_threshold)
+          warmup_requests:$warmup_requests,
+          warmup_above_threshold:$warmup_above_threshold,
+          # 워밍업이 드레인 상한에 걸렸으면 본 회차가 시작될 때 드레이너가
+          # 한가하지 않았다. 밀린 항목 자체는 상태 초기화가 스트림과 오프셋을
+          # 지우므로 아래 drain.seconds 에 안 들어온다. 남는 영향은 드레이너
+          # 경합과 그때까지 커진 check_ins 테이블이다.
+          warmup_drain_capped:$warmup_drain_capped},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},
