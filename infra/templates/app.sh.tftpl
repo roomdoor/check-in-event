@@ -1,0 +1,92 @@
+#!/bin/bash
+# A 호스트 — 측정 대상. GHCR 이미지를 받아 띄운다.
+#
+# 회차마다 드레이너 설정을 바꿔 다시 띄워야 하므로 기동을 스크립트로 빼둔다.
+# 오케스트레이터가 SSM 으로 /usr/local/bin/app-run.sh 를 부른다.
+set -euxo pipefail
+exec > >(tee /var/log/bench-bootstrap.log) 2>&1
+
+dnf install -y docker
+systemctl enable --now docker
+
+cat > /etc/sysctl.d/99-bench.conf <<'SYSCTL'
+net.core.somaxconn = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+fs.file-max = 2097152
+SYSCTL
+sysctl --system
+
+# 컨테이너의 파일 디스크립터 한도. 부하가 높으면 커넥션만으로 기본값을 넘긴다.
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/limits.conf <<'DROPIN'
+[Service]
+LimitNOFILE=1048576
+DROPIN
+systemctl daemon-reload
+systemctl restart docker
+
+# 비밀번호는 SSM 에서. set +x 로 감싸 추적 출력에 안 남게 한다.
+set +x
+DB_PASSWORD="$(aws ssm get-parameter --region "${region}" \
+  --name "${db_param}" --with-decryption \
+  --query 'Parameter.Value' --output text)"
+
+# -e 로 넘기지 않는다. ps 와 docker inspect 에 남는다.
+umask 077
+cat > /etc/bench-app.env <<ENVFILE
+SPRING_DATASOURCE_URL=jdbc:mysql://${support_host}:3306/${db_name}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&rewriteBatchedStatements=true
+SPRING_DATASOURCE_USERNAME=root
+SPRING_DATASOURCE_PASSWORD=$${DB_PASSWORD}
+SPRING_DATA_REDIS_HOST=${support_host}
+SPRING_DATA_REDIS_PORT=6379
+ENVFILE
+set -x
+
+# 이미지는 미리 받아둔다. 첫 회차에서 받으면 그 시간이 기동 대기에 섞인다.
+docker pull ${image}
+
+# 기동 스크립트. 인자는 그대로 Spring 인자가 된다.
+#   app-run.sh --checkin.redis.writer.batch-size=1000 --checkin.redis.writer.delay=100
+#
+# 히어독 안에 셸 확장과 Terraform 보간이 섞이면 서로 잡아먹는다 — 둘 다 달러
+# 기호로 시작한다. 따옴표 히어독으로 셸을 막아두고 Terraform 값은 sed 로 넣는다.
+cat > /usr/local/bin/app-run.sh <<'RUNNER'
+#!/bin/bash
+set -euo pipefail
+docker rm -f app >/dev/null 2>&1 || true
+docker run -d --name app --network host \
+  --env-file /etc/bench-app.env \
+  --ulimit nofile=1048576:1048576 \
+  __IMAGE__ "$@"
+
+# 뜰 때까지 기다리고, 실패하면 왜 죽었는지 남긴다. 이게 없으면 SSM 이 "성공" 을
+# 돌려주고 오케스트레이터가 빈 회차를 측정한다.
+for _ in $(seq 1 90); do
+  if curl -sf -o /dev/null http://localhost:8080/api/events/1 \
+     || curl -sf -o /dev/null -X POST http://localhost:8080/api/events \
+          -H 'Content-Type: application/json' -d '{"name":"probe","capacity":1}'; then
+    exit 0
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -q '^app$'; then
+    echo "컨테이너가 죽었다:" >&2
+    docker logs --tail 50 app >&2 2>&1 || true
+    exit 1
+  fi
+  sleep 2
+done
+echo "기동 시간 초과" >&2
+docker logs --tail 50 app >&2 2>&1 || true
+exit 1
+RUNNER
+chmod +x /usr/local/bin/app-run.sh
+sed -i "s|__IMAGE__|${image}|" /usr/local/bin/app-run.sh
+
+# 여기서 띄우지는 않는다. 오케스트레이터가 회차마다 인자를 바꿔 띄운다.
+# 다만 이미지가 실제로 뜨는지는 지금 확인해둔다 — 측정 시작하고 나서
+# 알게 되면 인스턴스를 다시 만들어야 한다.
+/usr/local/bin/app-run.sh
+docker rm -f app >/dev/null 2>&1 || true
+
+touch /var/lib/bench-ready
+echo "app host ready. run: /usr/local/bin/app-run.sh [spring args]"
