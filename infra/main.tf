@@ -32,7 +32,7 @@ module "bench" {
   #
   # 태그로 고정한다. ref=main 으로 두면 몇 주 뒤 apply 가 다른 모듈을 받아오고,
   # 그러면 같은 코드로 같은 인프라가 나온다는 보장이 사라진다.
-  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.2"
+  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.4"
 
   name_prefix = var.name_prefix
   region      = var.region
@@ -44,6 +44,10 @@ module "bench" {
   # 없으면 부트스트랩이 멈춘다. 측정을 시작하고 나서 스크립트가 없는 걸 알면
   # 인스턴스를 다시 만들어야 한다.
   bench_scripts = ["loadtest/run.sh", "loadtest/sweep.sh"]
+
+  # run.sh 는 부하 뒤에 B 호스트의 MySQL·Redis 를 직접 센다. 클라이언트가
+  # 없으면 회차마다 거부하므로, 없는 채로 뜨느니 부트스트랩에서 멈춘다.
+  required_commands = ["mysql", "redis-cli"]
 
   sut_port = 8080
 
