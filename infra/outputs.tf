@@ -59,29 +59,34 @@ output "next_steps" {
        받는 경로는 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을
        허용한다 — 로컬 회차와 섞이면 어느 쪽 수치였는지 알 수 없다.
 
-       스윕과 단발 회차는 받는 방법이 다르다. sweep.sh 는 끝에 자기 결과를
-       s3://<버킷>/results/<config 이름>/ 으로 이미 올린다. 그러니 스윕은
-       내려받기만 하면 된다.
+       버킷에는 회차가 접두사별로 쌓이고 destroy 할 때까지 남는다. 받을
+       때는 반드시 이번에 돌린 접두사 하나만 지정할 것. results/ 를 통째로
+       받으면 지난 스윕까지 딸려와 같은 결과가 두 번 커밋된다.
 
-       여기에 fetch-results.sh 를 쓰면 안 된다. 그 스크립트는 호스트에서
-       S3 로 올리는 단계부터 하는데, 올리는 자리가 results/ 바로 아래라
-       sweep.sh 가 넣어둔 것과 겹친다. 같은 회차가 results/<run_id>/ 와
-       results/<config>/<run_id>/ 양쪽에 생겨 두 번 커밋되고, 버킷에 남아
-       있던 지난 스윕까지 딸려 내려온다.
+       fetch-results.sh 는 쓰지 말 것. 올릴 때 REMOTE_RESULTS 의 마지막
+       디렉터리 이름을 버리고 results/ 바로 아래에 붓고, 내려받을 때는
+       REMOTE_RESULTS 와 무관하게 results/ 접두사 전체를 가져온다. 버킷에
+       이번 회차 말고 아무것도 없을 때만 맞는 스크립트다.
 
-       # 스윕이면 — 버킷에서 바로 내려받는다
        BUCKET="$(terraform -chdir=infra output -raw results_bucket)"
-       aws s3 sync "s3://$BUCKET/results/compare/" ./loadtest/results/ec2/compare/
 
-       # 단발 회차면 fetch-results.sh 를 쓴다. run.sh 는 S3 로 올리지 않으므로
-       # 호스트에서 올리는 단계가 필요하다. REMOTE_RESULTS 에는 run.sh 가
-       # 마지막에 찍어준 경로 하나만 줄 것 — results 디렉터리를 통째로 주면
-       # 저장소에 커밋돼 clone 을 타고 호스트에 가 있는 지난 결과까지 다시
-       # 올라왔다 내려오며 경로가 중첩된다.
-       TF_DIR=infra \
-       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/<run_id> \
-       DEST=./loadtest/results/ec2/<run_id> \
-         <k6-bench-kit>/scripts/fetch-results.sh
+       # 스윕이면 — sweep.sh 가 끝에 results/<config 이름>/ 으로 이미 올린다.
+       # 내려받기만 하면 된다. CFG 는 이번에 돌린 config 이름으로 바꿀 것.
+       CFG=compare
+       aws s3 sync "s3://$BUCKET/results/$CFG/" "./loadtest/results/ec2/$CFG/"
+
+       # 접두사를 틀리면 aws s3 sync 는 아무 말 없이 성공한다. 세어 볼 것 —
+       # 0 이면 받은 게 없는 것이고, 그대로 destroy 하면 결과가 사라진다.
+       find "./loadtest/results/ec2/$CFG" -name result.json | wc -l
+
+       # 단발 회차면 run.sh 가 S3 로 올리지 않으므로 올리는 단계가 필요하다.
+       # RUN 은 run.sh 가 마지막에 찍어준 디렉터리 이름이다.
+       # C 호스트에서:
+       RUN=redis-rate400-dup0.1-20260101-000000
+       aws s3 sync /opt/check-in-event/loadtest/results/$RUN/ \
+         "s3://$RESULTS_BUCKET/results/single/$RUN/"
+       # 로컬에서:
+       aws s3 sync "s3://$BUCKET/results/single/$RUN/" "./loadtest/results/ec2/$RUN/"
 
     4) 커밋한 뒤
        terraform -chdir=infra destroy
