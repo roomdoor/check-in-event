@@ -103,6 +103,19 @@ for _name in DRAIN_CAP_SECONDS DRAIN_POLL_SECONDS WRITER_BATCH_SIZE WRITER_DELAY
   esac
 done
 
+# 워밍업 출처도 같은 이유로 막는다. 둘 다 --argjson 으로 들어가므로,
+# 'yes' 나 '12k' 를 주면 부하와 드레인을 다 끝낸 뒤 마지막 jq 에서 죽고
+# result.json 이 안 남는다. 스윕이 줄 때는 정규화되지만 손으로 돌릴 때가 있다.
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
+case "${WARMUP_REQUESTS}" in
+  ''|*[!0-9]*) echo "WARMUP_REQUESTS 는 정수여야 한다. 받은 값: '${WARMUP_REQUESTS}'" >&2; exit 1 ;;
+esac
+WARMUP_DRAIN_CAPPED="${WARMUP_DRAIN_CAPPED:-false}"
+case "${WARMUP_DRAIN_CAPPED}" in
+  true|false) ;;
+  *) echo "WARMUP_DRAIN_CAPPED 는 true 또는 false 여야 한다. 받은 값: '${WARMUP_DRAIN_CAPPED}'" >&2; exit 1 ;;
+esac
+
 command -v k6 >/dev/null || { echo "k6 가 없다." >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq 가 없다." >&2; exit 1; }
 
@@ -310,8 +323,8 @@ jq -n \
   --arg violations "${violations}" \
   --arg base_url "${BASE_URL}" --arg redis_host "${REDIS_HOST}" --arg mysql_host "${MYSQL_HOST}" \
   --arg warmed_by "${WARMED_BY:-unknown}" \
-  --argjson warmup_requests "${WARMUP_REQUESTS:-0}" \
-  --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED:-false}" \
+  --argjson warmup_requests "${WARMUP_REQUESTS}" \
+  --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \

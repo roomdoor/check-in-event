@@ -331,7 +331,10 @@ for mode in ${MODES}; do
       # 나오므로 그냥 넘어가면 안 된다. 더 기다리고, 결과에도 남긴다.
       warmup_settle="${WARMUP_SETTLE_SECONDS}"
       if [ "${warmup_capped}" = true ]; then
+        # WARMUP_SETTLE_SECONDS=0 이면 곱해도 0 이라, 경고만 찍고 안 기다리는
+        # 꼴이 된다. 그 회차의 드레인 수치가 오염된 채로 넘어가므로 바닥을 둔다.
         warmup_settle=$(( WARMUP_SETTLE_SECONDS * 6 ))
+        [ "${warmup_settle}" -ge 30 ] || warmup_settle=30
         echo "경고: 워밍업이 드레인 상한(${WARMUP_DRAIN_CAP_SECONDS}s)에 걸렸다." >&2
         echo "      ${warmup_settle}s 더 기다린다. 이 회차의 드레인 수치는 워밍업 잔량이 섞였을 수 있다." >&2
       fi
@@ -371,19 +374,23 @@ echo
 echo "=============================================================="
 echo "  ${CONFIG_NAME} — ${total}회차 중 ${failed}회차 위반"
 echo "=============================================================="
-printf '%-6s %6s %6s %6s %8s %8s %8s %8s  %s\n' \
-  mode batch delay rate 정원 승인 드레인 p95ms 위반
+printf '%-6s %6s %6s %6s %8s %8s %8s %8s %8s  %s\n' \
+  mode batch delay rate 정원 승인 드레인 p95ms 워밍업 위반
 # 이 회차 것만 센다. 같은 설정을 다시 돌리면 결과가 같은 디렉터리에 쌓이는데,
 # 그걸 다 세면 위의 총계와 표가 어긋나고 어느 게 이번 것인지 알 수 없다.
 find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/null | sort | while read -r f; do
   # jq 가 깨진 파일에 실패하면 파이프라인이 0 이 아닌 상태를 내고, set -e 가
   # 여기서 스크립트를 끝낸다 — 아래 S3 업로드와 결과 경로 출력을 못 보고
   # 몇 시간짜리 스윕이 빈손으로 끝난다.
+  # 데웠는지를 표에도 싣는다. 파일을 열어야만 알 수 있으면, 스윕이 끝난 자리에서
+  # 표만 보고 "이건 웜 수치" 라고 착각한다 — 이 저장소가 실제로 그랬다.
   jq -r '[.mode, (.writer.batch_size|tostring), (.writer.delay_ms|tostring),
           (.load.rate|tostring), (.event.capacity|tostring), (.db.accepted|tostring),
-          ((.drain.seconds|tostring) + "s"), (.k6.p95_ms|tostring|.[0:7]), .violations]
+          ((.drain.seconds|tostring) + "s"), (.k6.p95_ms|tostring|.[0:7]),
+          ((.load.warmed_by // "?") + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
+          .violations]
          | @tsv' "$f" 2>/dev/null \
-    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9}' \
+    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s %8s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' \
     || echo "  (읽을 수 없음: ${f})"
 done || true
 
