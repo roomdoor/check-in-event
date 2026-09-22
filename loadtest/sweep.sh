@@ -41,10 +41,16 @@ DUP_RATIO="${DUP_RATIO:-0}"
 
 # 본 측정 전에 흘려보낼 부하의 길이. 0 이면 끈다.
 #
-# 30s 는 6400 RPS 에서 약 19만 요청이고, 그 정도면 p95 가 2ms 대로 내려온다.
-# 낮은 rate 에서는 요청 수가 적어 덜 데워지지만, 낮은 rate 는 콜드여도
-# 버티므로 문제가 안 된다. 회차마다 그만큼 길어진다는 것만 감안하면 된다.
+# 30s 는 6400 RPS 에서 약 19만 요청이다. 이 저장소에서 확인된 웜 상태는
+# 38만 요청을 처리한 뒤였고, 37만을 콜드로 받은 회차는 여전히 p95 1,474ms 였다.
+# 그 사이 어디서 충분해지는지는 안 재봤다 — 30s 는 근거 있는 출발점이지
+# 검증된 문턱이 아니다.
 WARMUP_DURATION="${WARMUP_DURATION:-30s}"
+
+# 이 수를 못 넘기면 "데웠다" 로 안 적는다. 낮은 rate 에서 30초면 몇 천 건뿐인데,
+# 그건 HotSpot 이 C2 까지 올리는 호출 수에 못 미친다. 정확한 문턱은 메서드마다
+# 다르고 동적이라, 이 값은 "명백히 모자란 구간을 거른다" 는 용도다.
+WARMUP_MIN_REQUESTS="${WARMUP_MIN_REQUESTS:-20000}"
 
 # 워밍업 회차의 드레인 대기 상한. 본 회차 값을 물려받으면 안 된다 — 과부하
 # 회차용으로 크게 잡아둔 값(예: 1800)을 워밍업이 쓰면, 출력이 버려진 채로
@@ -84,7 +90,7 @@ warmup_log="${warmup_root}/sweep-warmup.log"
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
 for _name in REPEATS CAPACITY APP_START_TIMEOUT WARMUP_DRAIN_CAP_SECONDS \
-             WARMUP_SETTLE_SECONDS WARMUP_DB_SETTLE_SECONDS; do
+             WARMUP_SETTLE_SECONDS WARMUP_DB_SETTLE_SECONDS WARMUP_MIN_REQUESTS; do
   eval "_val=\${${_name}}"
   case "${_val}" in
     ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
@@ -285,10 +291,8 @@ for mode in ${MODES}; do
     # 결과는 버린다 — 불변식이 깨져도 워밍업 회차의 일이라 무시한다.
     #
     # 워밍업이 남긴 행이 본 회차 집계에 섞이지는 않는다(모든 집계가 event_id
-    # 로 거른다). 다만 본 회차의 상태 초기화가 그 행들을 DELETE 하고 —
-    # ceiling.env 면 19만 행이다 — InnoDB 가 그 undo 를 백그라운드로 정리하는
-    # 동안 드레이너를 잰다. 드레이너 처리량이 테이블 유지 비용에 민감하다는
-    # 게 이 저장소의 미해결 항목이므로, 이 영향은 아직 정량화되지 않았다.
+    # 로 거른다). 본 회차의 상태 초기화가 그 행들을 치우는데, 그게 DELETE 면
+    # undo 정리가 드레인 측정과 겹친다 — 그래서 run.sh 가 TRUNCATE 를 쓴다.
     #
     # 콜드 상태를 일부러 재려면 WARMUP_DURATION=0 으로 끈다. 배포나
     # 스케일아웃 중에 피크가 오는 상황이 그쪽이다.
@@ -331,10 +335,16 @@ for mode in ${MODES}; do
       case "${warmup_reqs}" in ''|*[!0-9]*) warmup_reqs=0 ;; esac
       case "${warmup_capped}" in true) ;; *) warmup_capped=false ;; esac
 
-      if [ "${warmup_reqs}" -gt 0 ]; then
+      if [ "${warmup_reqs}" -ge "${WARMUP_MIN_REQUESTS}" ]; then
         warmed_by="${WARMUP_DURATION}"
         [ "${warmup_status}" -eq 0 ] || \
           echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
+      elif [ "${warmup_reqs}" -gt 0 ]; then
+        # 부하는 갔는데 양이 모자란다. 낮은 rate 에서 30초면 몇 천 건뿐이라
+        # HotSpot 이 C2 까지 안 올라간다. "데웠다" 로 적으면 거의 콜드인 회차를
+        # 웜으로 라벨링하는 것이라, 길이 대신 실제 양을 남긴다.
+        warmed_by="partial"
+        echo "경고: 워밍업 요청이 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 부분 워밍으로 기록한다." >&2
       else
         echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status}). 이 회차는 콜드로 기록한다." >&2
         tail -5 "${warmup_log}" >&2
@@ -423,7 +433,9 @@ find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/nu
           ((.drain.seconds|tostring) + "s"), (.k6.p95_ms|tostring|.[0:7]),
           ((.load.warmed_by // "?")
            + (if (.load.warmup_requests // 0) > 0
-              then "/" + (((.load.warmup_requests / 1000) | floor | tostring) + "k")
+              then "/" + (if .load.warmup_requests >= 1000
+                          then ((.load.warmup_requests / 1000) | floor | tostring) + "k"
+                          else (.load.warmup_requests | tostring) end)
               else "" end)
            + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
           .violations]

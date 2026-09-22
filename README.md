@@ -155,7 +155,7 @@ Redis 방식의 실제 저장은 `CheckInStreamWriter` 가 한다. 저장 처리
 | Tomcat 워커 | 200개 중 **196개가 유휴** (`TaskQueue.poll` 에서 대기) |
 | Redis 응답 대기 중인 워커 | 400 샘플 중 **1개** |
 | Lettuce 이벤트루프 | 133초 중 CPU 7.6초 = 코어의 **5.7%**, `EPoll.wait` 에서 대기 |
-| 호스트 CPU | 앱 31%, MySQL+Redis 28% (최대) |
+| 호스트 CPU | 부하 중 최대 앱 31%, MySQL+Redis 28%. 드레인 구간에 support 가 37% |
 
 **앱이 놀고 있었다.** 그런데 그 계측 회차의 p95 는 3200 RPS 에서 618ms, 6400 에서 1,576ms 였다. 앱이 한가한데 응답이 그렇게 걸린다는 건 앱이 막는 게 아니라는 뜻이고, 그 모순이 5 장으로 이어졌다.
 
@@ -479,7 +479,7 @@ AWS 측정에는 Terraform, AWS CLI 가 추가로 필요하다.
 
 ## 결과 디렉터리
 
-`loadtest/results/ec2/compare` — 1 장 전부와 2 장의 **첫 번째** 표. AWS 3호스트 실측 8회차. 2 장의 두 번째 표는 `warmup` 에서 온다.
+`loadtest/results/ec2/compare` — 1 장의 DB 락 표와 2 장의 **첫 번째** 표. AWS 3호스트 실측 8회차. **요약표의 Redis 행과 2 장의 두 번째 표는 `warmup` 에서 온다** — 요약표는 두 디렉터리에서 한 행씩 가져온 셈이고, 그래서 한쪽이 콜드다.
 
 `loadtest/results/ec2/drainer` — 3 장의 모든 수치. AWS 3호스트 실측 12회차.
 

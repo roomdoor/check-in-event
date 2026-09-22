@@ -148,7 +148,15 @@ redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT
 # 행만 지우고 events.accepted_count 를 두면 지난 이벤트들이 "행은 없는데
 # 참가자는 있다"는 상태로 남아 조회 API가 영구히 틀린 잔여 정원을 답한다.
 # 둘을 같이 되돌린다.
-mysql_query "DELETE FROM check_ins;" >/dev/null
+#
+# DELETE 가 아니라 TRUNCATE 다. DELETE 는 지운 행마다 undo 를 남기고 InnoDB 가
+# 그걸 백그라운드로 정리하는데, 그 정리가 이번 회차의 드레인 측정과 겹친다.
+# 스윕이 워밍업을 돌리면서 그 양이 커졌다 — ceiling.env 6400 회차면 19만 행이고,
+# 드레이너는 배치마다 check_ins 를 count(*) 한다. 드레이너 처리량이 이 저장소의
+# 측정 대상이라 그 위에 퍼지 부하를 얹으면 안 된다.
+# check_ins 는 events 를 참조하는 쪽이고 이를 참조하는 테이블이 없어 TRUNCATE 가
+# 허용된다(참조당하는 테이블이면 MySQL 이 거부한다).
+mysql_query "TRUNCATE TABLE check_ins;" >/dev/null
 mysql_query "UPDATE events SET accepted_count = 0;" >/dev/null
 
 run_id="${MODE}-rate${RATE}-dup${DUP_RATIO}-$(date +%Y%m%d-%H%M%S)"
