@@ -51,6 +51,10 @@ WARMUP_DURATION="${WARMUP_DURATION:-30s}"
 # 회차당 30분을 설 수 있다. 워밍업은 밀려도 버릴 회차라 짧게 끊는다.
 WARMUP_DRAIN_CAP_SECONDS="${WARMUP_DRAIN_CAP_SECONDS:-120}"
 
+# 워밍업이 끝나고 본 회차를 시작하기까지 쉬는 시간. db 모드는 드레인 대기가
+# 없어서 워밍업의 마지막 트랜잭션이 본 회차 첫 구간과 겹칠 수 있다.
+WARMUP_SETTLE_SECONDS="${WARMUP_SETTLE_SECONDS:-5}"
+
 # 앱을 재기동할 대상. 부트스트랩이 /etc/profile.d/bench.sh 에 심어둔다.
 SUT_INSTANCE_ID="${SUT_INSTANCE_ID:?SUT_INSTANCE_ID 가 필요하다. /etc/profile.d/bench.sh 를 source 했는지 확인할 것}"
 AWS_REGION="${AWS_REGION:?AWS_REGION 이 필요하다}"
@@ -64,11 +68,11 @@ SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
 # 표를 만들 때 같이 세어지고, S3 로도 올라간다.
 # 실제 생성은 검증을 통과한 뒤에 한다(아래).
 warmup_root="${RESULTS_ROOT}/.warmup"
-warmup_log="${RESULTS_ROOT}/.warmup.log"
+warmup_log="${warmup_root}/sweep-warmup.log"
 
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
-for _name in REPEATS CAPACITY APP_START_TIMEOUT; do
+for _name in REPEATS CAPACITY APP_START_TIMEOUT WARMUP_DRAIN_CAP_SECONDS WARMUP_SETTLE_SECONDS; do
   eval "_val=\${${_name}}"
   case "${_val}" in
     ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
@@ -92,11 +96,26 @@ esac
 # 끄는 값을 여기서 한 번에 정규화한다. '0s' 같은 값이 형식 검사는 통과하면서
 # "0 이 아니다" 로 분기하면, 끈 줄 알고 있는데 k6 가 0초 부하를 거부하고
 # 그 실패가 회차마다 반복된다.
-_warmup_num="${WARMUP_DURATION%[smh]}"
-case "${_warmup_num}" in
-  ''|*[!0-9]*) echo "WARMUP_DURATION 은 0 또는 30s, 1m 형태여야 한다. 받은 값: '${WARMUP_DURATION}'" >&2; exit 1 ;;
+_warmup_bad() {
+  echo "WARMUP_DURATION 은 0 또는 30s, 1m, 1m30s 형태여야 한다. 받은 값: '${WARMUP_DURATION}'" >&2
+  exit 1
+}
+case "${WARMUP_DURATION}" in
+  0) warmup_on=false ;;
+  # DURATION 과 같은 형태만 받는다. '30' 처럼 단위가 없으면 k6 가
+  # "missing unit" 으로 거부하고, 그 실패가 회차마다 반복된다.
+  *[0-9]s|*[0-9]m|*[0-9]h)
+    # 단위를 전부 떼고 숫자만 남긴다. '1m30s' 같은 복합 표기도 통과해야 한다.
+    _warmup_num="${WARMUP_DURATION//[smh]/}"
+    case "${_warmup_num}" in
+      ''|*[!0-9]*) _warmup_bad ;;
+      # 자리 중 하나라도 0 이 아니면 켠다. '0s'·'0m0s' 는 끈 것으로 본다 —
+      # 형식은 맞지만 k6 는 0 길이 부하를 거부한다.
+      *[1-9]*) warmup_on=true ;;
+      *) warmup_on=false ;;
+    esac ;;
+  *) _warmup_bad ;;
 esac
-if [ "${_warmup_num}" -eq 0 ]; then warmup_on=false; else warmup_on=true; fi
 for _list_name in RATES WRITER_BATCH_SIZES WRITER_DELAYS; do
   eval "_list=\${${_list_name}}"
   for _v in ${_list}; do
@@ -263,13 +282,40 @@ for mode in ${MODES}; do
         "RESULTS_ROOT=${warmup_root}" \
         "DRAIN_CAP_SECONDS=${WARMUP_DRAIN_CAP_SECONDS}" \
         "${SCRIPT_DIR}/run.sh" >"${warmup_log}" 2>&1 || warmup_status=$?
-      if [ "${warmup_status}" -ne 0 ]; then
-        echo "경고: 워밍업이 ${warmup_status} 로 끝났다. 이 회차는 데워지지 않았을 수 있다." >&2
-        tail -5 "${warmup_log}" >&2
-      else
-        warmed_by="${WARMUP_DURATION}"
+
+      # 데워졌는지는 종료코드가 아니라 부하가 실제로 갔는지로 판단한다.
+      # run.sh 는 어떤 불변식이 깨져도 1 로 끝나는데, 워밍업이 드레인 상한에
+      # 걸리는 건(드레인미완) 흔하고 JVM 은 이미 데워진 상태다. 종료코드로
+      # 정하면 그 회차가 warmed_by=none 으로 기록되어, 데운 회차를 콜드로
+      # 라벨링한다 — 이 코드가 막으려는 실수의 반대 방향이다.
+      warmup_reqs=0
+      warmup_result="$(find "${warmup_root}" -name result.json -print -quit 2>/dev/null)"
+      if [ -n "${warmup_result}" ]; then
+        warmup_reqs="$(jq -r '.k6.requests // 0' "${warmup_result}" 2>/dev/null)" || warmup_reqs=0
       fi
+      case "${warmup_reqs}" in ''|*[!0-9]*) warmup_reqs=0 ;; esac
+
+      if [ "${warmup_reqs}" -gt 0 ]; then
+        warmed_by="${WARMUP_DURATION}"
+        [ "${warmup_status}" -eq 0 ] || \
+          echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
+      else
+        echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status}). 이 회차는 콜드로 기록한다." >&2
+        tail -5 "${warmup_log}" >&2
+      fi
+
+      # 로그도 같이 지운다. warmup_root 안에 두는 이유가 그거다 —
+      # 밖에 두면 결과를 회수할 때 저장소에 섞여 들어간다.
       rm -rf "${warmup_root:?}"/*
+
+      # 워밍업이 남긴 일이 끝나기를 기다린다.
+      #
+      # 재기동 직후에는 진행 중인 작업이 없었지만, 이제 본 회차가 워밍업
+      # 바로 뒤에 붙는다. redis 모드는 run.sh 가 드레인을 기다려주므로
+      # 비어 있지만, db 모드는 드레인 단계 자체가 없다 — 워밍업의 마지막
+      # 트랜잭션들이 events 행 락을 쥔 채로 본 회차의 상태 초기화와
+      # 첫 부하에 겹친다.
+      sleep "${WARMUP_SETTLE_SECONDS}"
     fi
 
     round_status=0
@@ -320,6 +366,10 @@ if [ -n "${RESULTS_BUCKET:-}" ]; then
 fi
 
 echo
+# 워밍업 자리는 남기지 않는다. RESULTS_ROOT 아래라 결과를 회수할 때
+# 같이 딸려가고, .gitignore 가 ec2/ 아래를 통째로 되살리므로 커밋된다.
+[ "${warmup_on}" = false ] || rm -rf "${warmup_root:?}"
+
 echo "결과: ${SWEEP_ROOT}"
 echo "시작: ${started_at}  종료: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
