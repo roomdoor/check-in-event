@@ -165,15 +165,23 @@ redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT
 #     몇 시간짜리 스윕이 여기서 조용히 선다. 60초로 끊는다.
 #   - TRUNCATE 는 DROP 권한을 요구한다(DELETE 는 DELETE 권한이면 됐다).
 #     MYSQL_USER 를 최소 권한 계정으로 바꾸면 여기서 막힌다.
-mysql_query "SET SESSION lock_wait_timeout = 60; TRUNCATE TABLE check_ins;" >/dev/null
-# mysql_query 가 stderr 를 버리므로 실패해도 조용하다. 비었는지 직접 확인한다.
-_left="$(mysql_query "SELECT COUNT(*) FROM check_ins;")"
-case "${_left}" in
-  0) ;;
-  *) echo "상태 초기화 실패: check_ins 가 안 비었다(남은 행 '${_left}')." >&2
-     echo "       TRUNCATE 에는 DROP 권한이 필요하다. MYSQL_USER=${MYSQL_USER} 확인할 것." >&2
-     exit 1 ;;
-esac
+# 여기만 stderr 를 살린다. mysql_query 는 stderr 를 버리므로 TRUNCATE 가
+# 실패해도 조용한데, 행 수를 세서 추측하면 원인을 잘못 짚는다 — 락 대기
+# 만료인지 권한 부족인지 MySQL 이 이미 말해준다. 그대로 올린다.
+#
+# 행 수로 판정하지 않는 이유가 하나 더 있다. 워밍업 직후라 드레이너가 아직
+# 배치를 커밋할 수 있고, 그 행들은 워밍업의 event_id 를 달고 있어 이번 회차
+# 집계에 안 들어온다(모든 집계가 event_id 로 거른다). 전역으로 세면 그걸
+# 실패로 보고 멀쩡한 회차를 버린다.
+_truncate_err="$(${MYSQL_CLI} -N -B \
+  -e "SET SESSION lock_wait_timeout = 60; TRUNCATE TABLE check_ins;" \
+  "${MYSQL_DATABASE}" 2>&1 >/dev/null)" || {
+    echo "상태 초기화 실패 — check_ins TRUNCATE:" >&2
+    echo "  ${_truncate_err}" >&2
+    echo "  TRUNCATE 는 DROP 권한을 요구하고(DELETE 는 아니었다), 메타데이터 락을" >&2
+    echo "  기다린다. MYSQL_USER=${MYSQL_USER} 권한과 드레이너 상태를 확인할 것." >&2
+    exit 1
+  }
 mysql_query "UPDATE events SET accepted_count = 0;" >/dev/null
 
 run_id="${MODE}-rate${RATE}-dup${DUP_RATIO}-$(date +%Y%m%d-%H%M%S)"
@@ -387,7 +395,9 @@ jq -n \
           warmup_requests:$warmup_requests,
           warmup_sufficient:$warmup_sufficient,
           # 워밍업이 드레인 상한에 걸렸으면 본 회차가 시작될 때 드레이너가
-          # 한가하지 않았다. 아래 drain.seconds 에 워밍업 잔량이 섞인다.
+          # 한가하지 않았다. 밀린 항목 자체는 상태 초기화가 스트림과 오프셋을
+          # 지우므로 아래 drain.seconds 에 안 들어온다. 남는 영향은 드레이너
+          # 경합과 그때까지 커진 check_ins 테이블이다.
           warmup_drain_capped:$warmup_drain_capped},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},

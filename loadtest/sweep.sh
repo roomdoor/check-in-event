@@ -52,6 +52,12 @@ WARMUP_DURATION="${WARMUP_DURATION:-30s}"
 # 다르고 동적이라, 이 값은 "명백히 모자란 구간을 거른다" 는 용도다.
 WARMUP_MIN_REQUESTS="${WARMUP_MIN_REQUESTS:-20000}"
 
+# 기준을 못 채우면 몇 번까지 더 도는가. 길이가 아니라 나간 양으로 판단해야
+# 낮은 rate 와 db 모드가 데워진다 — db 는 rate 를 올려도 앱이 초당 205건에서
+# 포화하므로 30초에 6,000건이 천장이고, 한 번으로는 영원히 기준을 못 넘는다.
+# 상한을 두는 이유는 앱이 아예 못 받는 상태일 때 무한히 도는 걸 막으려는 것이다.
+WARMUP_MAX_ROUNDS="${WARMUP_MAX_ROUNDS:-4}"
+
 # 워밍업 회차의 드레인 대기 상한. 본 회차 값을 물려받으면 안 된다 — 과부하
 # 회차용으로 크게 잡아둔 값(예: 1800)을 워밍업이 쓰면, 출력이 버려진 채로
 # 회차당 30분을 설 수 있다. 워밍업은 밀려도 버릴 회차라 짧게 끊는다.
@@ -90,7 +96,8 @@ warmup_log="${warmup_root}/sweep-warmup.log"
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
 for _name in REPEATS CAPACITY APP_START_TIMEOUT WARMUP_DRAIN_CAP_SECONDS \
-             WARMUP_SETTLE_SECONDS WARMUP_DB_SETTLE_SECONDS WARMUP_MIN_REQUESTS; do
+             WARMUP_SETTLE_SECONDS WARMUP_DB_SETTLE_SECONDS WARMUP_MIN_REQUESTS \
+             WARMUP_MAX_ROUNDS; do
   eval "_val=\${${_name}}"
   case "${_val}" in
     ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
@@ -306,56 +313,75 @@ for mode in ${MODES}; do
     warmup_reqs=0
     warmup_capped=false
     warmup_sufficient=false
+    warmup_rounds=0
     if [ "${warmup_on}" = true ]; then
       warmed_by=none
-      echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
-      # 쓰기 전에 비운다. 뒤에서 비우면, 지난 스윕이 워밍업 직후에 죽었을 때
-      # 남은 result.json 을 이번 첫 회차가 읽고 "데워졌다" 로 판단한다.
-      rm -rf "${warmup_root:?}"
-      mkdir -p "${warmup_root}"
+      # 요청 수가 찰 때까지 반복한다. 길이만 고정하면 낮은 rate 에서는
+      # 영원히 기준을 못 넘는다 — 30초 x 100 RPS 면 3,000건이다. db 모드는
+      # 더 나쁘다. rate 를 아무리 올려도 앱이 초당 205건에서 포화하므로
+      # 30초에 6,000건이 천장이다. 시간을 재는 대신 나간 양을 센다.
       warmup_status=0
-      # 출력은 버리되 실패는 알린다. 조용히 넘어가면 워밍업이 매 회차 깨진 채로
-      # 스윕이 끝나고, 그건 이 코드가 막으려는 상태(콜드 측정) 그대로다.
-      #
-      # 드레인 상한은 따로 짧게 준다. round_env 의 값을 물려받으면(ceiling.env 는
-      # 1800) 워밍업이 드레이너를 밀었을 때 회차당 30분을 아무 출력 없이 선다.
-      env "${round_env[@]}" \
-        "DURATION=${WARMUP_DURATION}" \
-        "RESULTS_ROOT=${warmup_root}" \
-        "DRAIN_CAP_SECONDS=${WARMUP_DRAIN_CAP_SECONDS}" \
-        "${SCRIPT_DIR}/run.sh" >"${warmup_log}" 2>&1 || warmup_status=$?
+      while [ "${warmup_rounds}" -lt "${WARMUP_MAX_ROUNDS}" ]; do
+        warmup_rounds=$(( warmup_rounds + 1 ))
+        echo "==> 워밍업 ${warmup_rounds}/${WARMUP_MAX_ROUNDS} · ${WARMUP_DURATION} (결과는 버린다)"
 
-      # 데워졌는지는 종료코드가 아니라 부하가 실제로 갔는지로 판단한다.
-      # run.sh 는 어떤 불변식이 깨져도 1 로 끝나는데, 워밍업이 드레인 상한에
-      # 걸리는 건(드레인미완) 흔하고 JVM 은 이미 데워진 상태다. 종료코드로
-      # 정하면 그 회차가 warmed_by=none 으로 기록되어, 데운 회차를 콜드로
-      # 라벨링한다 — 이 코드가 막으려는 실수의 반대 방향이다.
-      # set -e 아래에서 find 가 0 이 아닌 상태로 끝나면 대입이 그대로 스윕을
-      # 죽인다. 몇 시간짜리가 요약도 S3 업로드도 없이 끝난다.
-      warmup_result="$(find "${warmup_root}" -name result.json -print -quit 2>/dev/null)" || warmup_result=""
-      if [ -n "${warmup_result}" ]; then
-        warmup_reqs="$(jq -r '.k6.requests // 0' "${warmup_result}" 2>/dev/null)" || warmup_reqs=0
-        warmup_capped="$(jq -r '.drain.capped // false' "${warmup_result}" 2>/dev/null)" || warmup_capped=false
-      fi
-      case "${warmup_reqs}" in ''|*[!0-9]*) warmup_reqs=0 ;; esac
-      case "${warmup_capped}" in true) ;; *) warmup_capped=false ;; esac
+        # 쓰기 전에 비운다. 뒤에서 비우면, 지난 스윕이 워밍업 직후에 죽었을 때
+        # 남은 result.json 을 이번 첫 회차가 읽고 "데워졌다" 로 판단한다.
+        rm -rf "${warmup_root:?}"
+        mkdir -p "${warmup_root}"
+
+        # 출력은 버리되 실패는 알린다. 조용히 넘어가면 워밍업이 매 회차 깨진 채로
+        # 스윕이 끝나고, 그건 이 코드가 막으려는 상태(콜드 측정) 그대로다.
+        #
+        # 드레인 상한은 따로 짧게 준다. round_env 의 값을 물려받으면(ceiling.env 는
+        # 1800) 워밍업이 드레이너를 밀었을 때 회차당 30분을 아무 출력 없이 선다.
+        warmup_status=0
+        env "${round_env[@]}" \
+          "DURATION=${WARMUP_DURATION}" \
+          "RESULTS_ROOT=${warmup_root}" \
+          "DRAIN_CAP_SECONDS=${WARMUP_DRAIN_CAP_SECONDS}" \
+          "${SCRIPT_DIR}/run.sh" >"${warmup_log}" 2>&1 || warmup_status=$?
+
+        # 데워졌는지는 종료코드가 아니라 부하가 실제로 갔는지로 판단한다.
+        # run.sh 는 어떤 불변식이 깨져도 1 로 끝나는데, 워밍업이 드레인 상한에
+        # 걸리는 건(드레인미완) 흔하고 JVM 은 이미 데워진 상태다. 종료코드로
+        # 정하면 그 회차가 warmed_by=none 으로 기록되어, 데운 회차를 콜드로
+        # 라벨링한다 — 이 코드가 막으려는 실수의 반대 방향이다.
+        # set -e 아래에서 find 가 0 이 아닌 상태로 끝나면 대입이 그대로 스윕을
+        # 죽인다. 몇 시간짜리가 요약도 S3 업로드도 없이 끝난다.
+        warmup_result="$(find "${warmup_root}" -name result.json -print -quit 2>/dev/null)" || warmup_result=""
+        this_reqs=0
+        if [ -n "${warmup_result}" ]; then
+          this_reqs="$(jq -r '.k6.requests // 0' "${warmup_result}" 2>/dev/null)" || this_reqs=0
+          warmup_capped="$(jq -r '.drain.capped // false' "${warmup_result}" 2>/dev/null)" || warmup_capped=false
+        fi
+        case "${this_reqs}" in ''|*[!0-9]*) this_reqs=0 ;; esac
+        case "${warmup_capped}" in true) ;; *) warmup_capped=false ;; esac
+
+        # 부하가 아예 안 나가면 더 돌려도 같다. 설정이나 앱 문제다.
+        if [ "${this_reqs}" -eq 0 ]; then
+          echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status})." >&2
+          tail -5 "${warmup_log}" >&2
+          break
+        fi
+
+        warmup_reqs=$(( warmup_reqs + this_reqs ))
+        [ "${warmup_reqs}" -lt "${WARMUP_MIN_REQUESTS}" ] || { warmup_sufficient=true; break; }
+        echo "    누적 ${warmup_reqs}건 (기준 ${WARMUP_MIN_REQUESTS}). 더 돈다." >&2
+      done
 
       if [ "${warmup_reqs}" -gt 0 ]; then
         # 기간은 그대로 남긴다. 값 집합 밖의 라벨을 새로 만들면 문서와 어긋나고,
         # "데워졌는가" 로 거르는 jq 필터가 그걸 웜으로 세거나 빠뜨린다.
-        # 충분했는지는 아래 warmup_sufficient 가 따로 말한다.
+        # 충분했는지는 warmup_sufficient 가 따로 말한다.
         warmed_by="${WARMUP_DURATION}"
+        [ "${warmup_rounds}" -le 1 ] || warmed_by="${WARMUP_DURATION}x${warmup_rounds}"
         [ "${warmup_status}" -eq 0 ] || \
           echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
-        if [ "${warmup_reqs}" -ge "${WARMUP_MIN_REQUESTS}" ]; then
-          warmup_sufficient=true
-        else
-          # 낮은 rate 에서 30초면 몇 천 건뿐이라 HotSpot 이 C2 까지 안 올라간다.
-          echo "경고: 워밍업 요청이 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
-        fi
+        [ "${warmup_sufficient}" = true ] || \
+          echo "경고: ${WARMUP_MAX_ROUNDS}회를 돌고도 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
       else
-        echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status}). 이 회차는 콜드로 기록한다." >&2
-        tail -5 "${warmup_log}" >&2
+        echo "경고: 이 회차는 콜드로 기록한다." >&2
       fi
 
       # 워밍업이 드레인 상한에 걸렸으면 드레이너가 아직 일하는 중이다.
@@ -383,8 +409,12 @@ for mode in ${MODES}; do
       fi
       if [ -n "${warmup_settle_reason}" ]; then
         echo "${warmup_settle_reason}. ${warmup_settle}s 기다린다." >&2
+        # 밀린 양을 빼주려는 게 아니다. 120초에 못 뺀 걸 30초에 뺄 리 없고,
+        # 본 회차의 상태 초기화가 스트림과 오프셋을 어차피 지운다. 기다리는
+        # 건 진행 중인 배치가 끝나라고 주는 시간이다. 남는 영향은 드레이너
+        # 경합과 커진 테이블이고, 그건 결과의 warmup_drain_capped 로 남긴다.
         [ "${warmup_capped}" = false ] || \
-          echo "      이 회차의 드레인 수치는 워밍업 잔량이 섞였을 수 있다." >&2
+          echo "      진행 중인 배치가 끝날 시간이다. 밀린 양은 상태 초기화가 지운다." >&2
       fi
 
       # 워밍업이 남긴 일이 끝나기를 기다린다.
