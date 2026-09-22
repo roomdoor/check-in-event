@@ -115,7 +115,11 @@ Redis 방식의 실제 저장은 `CheckInStreamWriter` 가 한다. 저장 처리
 
 **Redis 방식의 천장을 못 찾았다.** 800 RPS 에서도 드레인이 0초라 한계가 그 위 어딘가라는 것만 안다. 1,600·3,200 으로 올려야 나온다.
 
-**DB 락의 400·800 회차는 VU 풀이 말랐다.** k6 가 2,000개를 다 쓰고 `Insufficient VUs` 를 냈다. 부하가 다 안 갔다는 뜻이므로 **그 두 회차의 p95 는 하한이지 측정값이 아니다.** 처리량(205/s)은 두 회차가 같은 값이라 읽어도 된다. 버려진 이터레이션 수(10,578 / 34,597)는 "DB 가 못 받았다"와 "k6 가 못 보냈다"가 섞인 값이다.
+**DB 락 쪽은 k6 가 부하를 다 못 보낸 회차가 있다.** 400·800 은 VU 2,000개를 다 쓰고 `Insufficient VUs` 를 냈다. 부하가 다 안 갔다는 뜻이므로 **그 두 회차의 p95 는 하한이지 측정값이 아니다.** 처리량(205/s)은 두 회차가 같은 값이라 읽어도 된다. 버려진 이터레이션 수(10,578 / 34,597)는 "DB 가 못 받았다"와 "k6 가 못 보냈다"가 섞인 값이다.
+
+**200 회차도 깨끗하지 않다.** 커밋된 회차는 전부 `PRE_VUS=50` 으로 돌았다 — k6 가 나머지 VU 를 부하 도중에 만든다. 200 RPS 에서 버려진 201건은 DB 가 못 받아서가 아니라 그 준비 과정일 가능성이 크다(p95 1,251ms 면 250개면 충분한 구간이다). 저장량 자체는 도착률을 따라갔으므로 1 장의 "100 과 200 사이에서 무너진다"는 판단은 남지만, **그 201건을 포화 신호로 읽으면 안 된다.**
+
+`compare.env` 는 그 뒤에 `PRE_VUS=2000` 으로 고쳤다. **지금 설정으로 다시 돌리면 이 표와 같은 값이 나오지 않는다** — 다음 회차부터 적용된다.
 
 **Redis 의 p95 가 부하가 셀수록 낮아진다**(6.8 → 3.3ms). 방향이 반대다. 회차마다 앱을 재기동하므로 모든 회차가 콜드 JVM 에서 시작하고, 바쁜 회차가 JIT 을 더 끝낸다. **현상이지 결과가 아니다.**
 
@@ -123,7 +127,7 @@ Redis 방식의 실제 저장은 `CheckInStreamWriter` 가 한다. 저장 처리
 
 **정원 근처를 안 쟀다.** 두 스윕 모두 정원을 부하보다 훨씬 크게 뒀다. 실제 선착순은 대부분이 거절인 구간인데, 거절은 저장하지 않으므로 그쪽의 처리 특성은 이 수치로 알 수 없다.
 
-**전부 n=1 이다.** 커밋된 20회차 모두 `REPEATS=1` 이다.
+**전부 n=1 이다.** 커밋된 21회차 모두 반복 없이 한 번씩 돌았다.
 
 ### 시스템 쪽 한계
 
@@ -196,7 +200,7 @@ k6 는 `DURATION` 에서 멈추지만 Redis 방식은 그 시점에 아직 저�
 
 ### 거절은 저장하지 않는다
 
-선착순은 정원보다 요청이 훨씬 많다. 거절까지 원장에 남기면 **쓰기의 대부분이 "떨어진 사람" 기록**이 된다. 400 RPS·정원 1,000 에서 승인 1,000 대 거절 5,384 였다.
+선착순은 정원보다 요청이 훨씬 많다. 거절까지 원장에 남기면 **쓰기의 대부분이 "떨어진 사람" 기록**이 된다. 400 RPS·정원 2,000 을 30초 준 회차에서 승인 2,000 대 거절 7,635 였다 — 원장에 남겼다면 쓰기의 79%가 거절이다([원본](loadtest/results/ec2/redis-rate400-dup0.2-20260922-010918)).
 
 거절은 응답으로 알려주고 끝낸다. **두 방식 모두** 그렇게 맞췄다 — 한쪽만 바꾸면 서로 다른 양의 일을 하게 되어 처리량 비교가 다시 무의미해진다.
 
@@ -266,7 +270,9 @@ src/main/kotlin/com/checkin/event/
     ├── controller/       CheckInController (DB 락), CheckInRedisController
     ├── service/          CheckInService — events 행을 잠그고 요청 안에서 저장
     │                     CheckInServiceByRedis — Lua 판정 후 즉시 응답
-    │                     CheckInStreamWriter — 스트림에서 꺼내 MySQL 배치 저장
+    │                     CheckInStreamWriter — 스트림을 읽고 오프셋을 전진시킨다
+    │                     CheckInStreamPersistService — 배치 삽입과 승인 인원 집계.
+    │                       3 장의 "batch 는 재시도 단위" 가 가리키는 자리다
     ├── redis/            CheckInRedisStore — Lua 스크립트
     └── repository/       CheckInBatchRepository — 배치 저장, 승인 인원 집계
 
@@ -365,7 +371,7 @@ AWS 측정에는 Terraform, AWS CLI 가 추가로 필요하다.
 
 ## Tech Stack
 
-**Backend**: Kotlin · Spring Boot 3.3 · JPA + Flyway · MySQL 8 · Redis 7.2 (Lua + Stream)
+**Backend**: Kotlin · Spring Boot 3.3 · JPA (Hibernate `ddl-auto: update`) · MySQL 8 · Redis 7.2 (Lua + Stream)
 **측정**: k6 · Terraform · AWS (EC2 · SSM · S3)
 **Build**: Gradle (Kotlin DSL) · JDK 17
 
@@ -378,6 +384,8 @@ AWS 측정에는 Terraform, AWS CLI 가 추가로 필요하다.
 `loadtest/results/ec2/compare` — 1 장과 2 장의 모든 수치. AWS 3호스트 실측 8회차.
 
 `loadtest/results/ec2/drainer` — 3 장의 모든 수치. AWS 3호스트 실측 12회차.
+
+`loadtest/results/ec2/redis-rate400-dup0.2-20260922-010918` — 스윕 자동화 이전의 단발 회차 하나. "거절은 저장하지 않는다" 의 비율이 여기서 나온다. `result.json` 이 옛 형식이라 **어디에 대고 쟀는지(`where`)가 없다** — 아래 "조건은 회차마다 기록한다" 는 그 뒤에 넣은 것이다.
 
 **로컬 회차는 커밋하지 않는다.** 앱·MySQL·Redis·k6 가 한 머신에 있으면 무엇이 병목인지 구분되지 않아 수치로 쓸 수 없다. `.gitignore` 가 `ec2/` 아래만 커밋을 허용한다.
 
