@@ -43,7 +43,7 @@ module "bench" {
 
   # 없으면 부트스트랩이 멈춘다. 측정을 시작하고 나서 스크립트가 없는 걸 알면
   # 인스턴스를 다시 만들어야 한다.
-  bench_scripts = ["loadtest/run.sh"]
+  bench_scripts = ["loadtest/run.sh", "loadtest/sweep.sh"]
 
   sut_port = 8080
 
