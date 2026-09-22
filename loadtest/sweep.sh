@@ -67,7 +67,9 @@ SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
 # 워밍업 회차가 결과를 쓰는 자리. SWEEP_ROOT 밖에 둔다 — 안에 두면 끝에
 # 표를 만들 때 같이 세어지고, S3 로도 올라간다.
 # 실제 생성은 검증을 통과한 뒤에 한다(아래).
-warmup_root="${RESULTS_ROOT}/.warmup"
+# config 이름을 붙인다. 한 호스트에서 두 스윕을 동시에 돌리면, 자리를 공유할
+# 경우 서로의 result.json 을 읽고 서로의 출력을 지운다.
+warmup_root="${RESULTS_ROOT}/.warmup-${CONFIG_NAME}"
 warmup_log="${warmup_root}/sweep-warmup.log"
 
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
@@ -191,7 +193,8 @@ app_restart() {
 mkdir -p "${SWEEP_ROOT}"
 # 검증을 통과한 뒤에 만든다. 위에 두면 설정이 틀려 멈춘 실행도 .warmup/ 을
 # 남긴다.
-[ "${warmup_on}" = false ] || mkdir -p "${warmup_root}"
+# 워밍업 자리는 회차마다 쓰기 직전에 만든다(아래). 여기서는 만들지 않는다 —
+# 스윕이 워밍업 없이 끝나면 빈 디렉터리조차 남기지 않는다.
 
 total=0
 failed=0
@@ -271,6 +274,10 @@ for mode in ${MODES}; do
     warmed_by=none
     if [ "${warmup_on}" = true ]; then
       echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
+      # 쓰기 전에 비운다. 뒤에서 비우면, 지난 스윕이 워밍업 직후에 죽었을 때
+      # 남은 result.json 을 이번 첫 회차가 읽고 "데워졌다" 로 판단한다.
+      rm -rf "${warmup_root:?}"
+      mkdir -p "${warmup_root}"
       warmup_status=0
       # 출력은 버리되 실패는 알린다. 조용히 넘어가면 워밍업이 매 회차 깨진 채로
       # 스윕이 끝나고, 그건 이 코드가 막으려는 상태(콜드 측정) 그대로다.
@@ -303,10 +310,6 @@ for mode in ${MODES}; do
         echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status}). 이 회차는 콜드로 기록한다." >&2
         tail -5 "${warmup_log}" >&2
       fi
-
-      # 로그도 같이 지운다. warmup_root 안에 두는 이유가 그거다 —
-      # 밖에 두면 결과를 회수할 때 저장소에 섞여 들어간다.
-      rm -rf "${warmup_root:?}"/*
 
       # 워밍업이 남긴 일이 끝나기를 기다린다.
       #
