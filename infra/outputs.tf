@@ -51,9 +51,13 @@ output "next_steps" {
        MODE=redis RATE=400 DURATION=1m CAPACITY=10000 ./loadtest/run.sh
 
     3) 결과 회수 (로컬에서, destroy 전에 반드시)
+
+       DEST 를 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을 허용한다 —
+       로컬 회차와 섞이면 나중에 어느 쪽 수치였는지 알 수 없다.
+
        TF_DIR=infra \
        REMOTE_RESULTS=/opt/check-in-event/loadtest/results \
-       DEST=./loadtest/results \
+       DEST=./loadtest/results/ec2 \
          <k6-bench-kit>/scripts/fetch-results.sh
 
     4) 커밋한 뒤

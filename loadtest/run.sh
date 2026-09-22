@@ -308,6 +308,8 @@ jq -n \
   --arg run_id "${run_id}" --arg mode "${MODE}" --arg started_at "${started_at}" \
   --arg duration "${DURATION}" --arg dup_ratio "${DUP_RATIO}" \
   --arg violations "${violations}" \
+  --arg base_url "${BASE_URL}" --arg redis_host "${REDIS_HOST}" --arg mysql_host "${MYSQL_HOST}" \
+  --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
   --argjson db_accepted "${db_accepted:-0}" --argjson db_rejected "${db_rejected:-0}" \
@@ -319,7 +321,11 @@ jq -n \
   --argjson k6_reqs "${k6_reqs}" --argjson k6_dropped "${k6_dropped}" --argjson k6_p95 "${k6_p95}" \
   --argjson k6_dup_sent "${k6_dup_sent}" --argjson k6_rejected "${k6_rejected}" \
   '{run_id:$run_id, mode:$mode, started_at:$started_at, event_id:$event_id,
-    load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio},
+    # 어디서 돌았는지. 세 주소가 전부 로컬이면 한 머신에서 잰 것이고, 그 수치는
+    # 무엇이 병목인지 구분되지 않아 쓸 수 없다. 파일만 보고 알 수 있어야 한다.
+    where:{base_url:$base_url, redis_host:$redis_host, mysql_host:$mysql_host},
+    load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio,
+          pre_vus:$pre_vus, max_vus:$max_vus},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},
