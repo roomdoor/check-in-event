@@ -145,8 +145,19 @@ echo "    event_id=${EVENT_ID}"
 
 # 이벤트를 새로 만들어도 스트림과 오프셋은 전역이라 지난 회차가 남는다.
 echo "==> 상태 초기화"
-redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT_ID}:pos" \
-  checkins:stream checkins:stream:offset >/dev/null
+redis_cmd DEL checkins:stream checkins:stream:offset >/dev/null
+
+# 지난 회차들의 이벤트 키를 거둔다.
+#
+# event:<id>:* 를 EVENT_ID 로 지우는 건 의미가 없다 — 그 ID 는 방금 만든
+# 것이라 아직 키가 없다. 실제로 쌓이는 건 이전 회차들 것이고, Redis 가
+# maxmemory 없이 noeviction 으로 도는 데다 회차마다 워밍업까지 붙어서
+# 승인 수만큼의 SET·HASH 가 계속 남는다. 측정 대상 호스트의 Redis 다.
+#
+# 방금 만든 이벤트의 키까지 지워지지만 아직 비어 있어 무해하다 — Lua 가
+# 첫 승인 때 만든다.
+_stale_keys="$(${REDIS_CLI} --scan --pattern 'event:*' 2>/dev/null | tr '\n' ' ')" || _stale_keys=""
+[ -z "${_stale_keys}" ] || redis_cmd DEL ${_stale_keys} >/dev/null
 # 행만 지우고 events.accepted_count 를 두면 지난 이벤트들이 "행은 없는데
 # 참가자는 있다"는 상태로 남아 조회 API가 영구히 틀린 잔여 정원을 답한다.
 # 둘을 같이 되돌린다.

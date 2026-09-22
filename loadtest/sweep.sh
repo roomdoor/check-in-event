@@ -131,7 +131,9 @@ case "${WARMUP_DURATION}" in
   # "missing unit" 으로 거부하고, 그 실패가 회차마다 반복된다.
   *[0-9]s|*[0-9]m|*[0-9]h)
     # 단위를 전부 떼고 숫자만 남긴다. '1m30s' 같은 복합 표기도 통과해야 한다.
-    _warmup_num="${WARMUP_DURATION//[smh]/}"
+    # 소수점을 허용한다. DURATION 검사는 '1.5m' 을 통과시키고 k6 도 받는데,
+    # 여기서만 거부하면 두 값의 형식이 달라진다.
+    _warmup_num="${WARMUP_DURATION//[smh.]/}"
     case "${_warmup_num}" in
       ''|*[!0-9]*) _warmup_bad ;;
       # 자리 중 하나라도 0 이 아니면 켠다. '0s'·'0m0s' 는 끈 것으로 본다 —
@@ -382,8 +384,11 @@ for mode in ${MODES}; do
         [ "${warmup_rounds}" -le 1 ] || warmed_by="${WARMUP_DURATION}x${warmup_rounds}"
         [ "${warmup_status}" -eq 0 ] || \
           echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
+        # 실제로 돈 횟수를 쓴다. 상한을 쓰면 부하가 끊겨 중간에 멈춘 경우에도
+        # "4회를 돌고도" 라고 나와서, 앱이 죽은 걸 "이 rate 는 원래 느리다" 로
+        # 읽게 된다.
         [ "${warmup_above_threshold}" = true ] || \
-          echo "경고: ${WARMUP_MAX_ROUNDS}회를 돌고도 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
+          echo "경고: ${warmup_rounds}회를 돌고도 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
       else
         echo "경고: 이 회차는 콜드로 기록한다." >&2
       fi
@@ -457,7 +462,10 @@ echo
 echo "=============================================================="
 echo "  ${CONFIG_NAME} — ${total}회차 중 ${failed}회차 위반"
 echo "=============================================================="
-printf '%-6s %6s %6s %6s %8s %8s %8s %8s %10s  %s\n' \
+# 워밍업 열은 12 자리다. 최악이 '30sx4/240k?!' 라 그보다 좁으면 위반 열이
+# 밀리는데, 하필 그게 제일 눈여겨봐야 할 회차다(반복했고, 기준 미달이고,
+# 드레인 상한에 걸림).
+printf '%-6s %6s %6s %6s %8s %8s %8s %8s %12s  %s\n' \
   mode batch delay rate 정원 승인 드레인 p95ms 워밍업 위반
 # 이 회차 것만 센다. 같은 설정을 다시 돌리면 결과가 같은 디렉터리에 쌓이는데,
 # 그걸 다 세면 위의 총계와 표가 어긋나고 어느 게 이번 것인지 알 수 없다.
@@ -485,7 +493,7 @@ find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/nu
            + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
           .violations]
          | @tsv' "$f" 2>/dev/null \
-    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s %10s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' \
+    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s %12s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' \
     || echo "  (읽을 수 없음: ${f})"
 done || true
 
