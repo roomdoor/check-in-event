@@ -312,7 +312,7 @@ for mode in ${MODES}; do
     warmed_by=off
     warmup_reqs=0
     warmup_capped=false
-    warmup_sufficient=false
+    warmup_above_threshold=false
     warmup_rounds=0
     if [ "${warmup_on}" = true ]; then
       warmed_by=none
@@ -321,9 +321,10 @@ for mode in ${MODES}; do
       # 더 나쁘다. rate 를 아무리 올려도 앱이 초당 205건에서 포화하므로
       # 30초에 6,000건이 천장이다. 시간을 재는 대신 나간 양을 센다.
       warmup_status=0
-      while [ "${warmup_rounds}" -lt "${WARMUP_MAX_ROUNDS}" ]; do
-        warmup_rounds=$(( warmup_rounds + 1 ))
-        echo "==> 워밍업 ${warmup_rounds}/${WARMUP_MAX_ROUNDS} · ${WARMUP_DURATION} (결과는 버린다)"
+      warmup_attempt=0
+      while [ "${warmup_attempt}" -lt "${WARMUP_MAX_ROUNDS}" ]; do
+        warmup_attempt=$(( warmup_attempt + 1 ))
+        echo "==> 워밍업 ${warmup_attempt}/${WARMUP_MAX_ROUNDS} · ${WARMUP_DURATION} (결과는 버린다)"
 
         # 쓰기 전에 비운다. 뒤에서 비우면, 지난 스윕이 워밍업 직후에 죽었을 때
         # 남은 result.json 을 이번 첫 회차가 읽고 "데워졌다" 로 판단한다.
@@ -365,20 +366,23 @@ for mode in ${MODES}; do
           break
         fi
 
+        # 부하가 실제로 나간 회차만 센다. 시도 횟수를 세면 부하 없이 죽은
+        # 회차까지 포함돼 라벨이 없던 시간을 주장한다(30sx3 인데 60초만 나감).
+        warmup_rounds=$(( warmup_rounds + 1 ))
         warmup_reqs=$(( warmup_reqs + this_reqs ))
-        [ "${warmup_reqs}" -lt "${WARMUP_MIN_REQUESTS}" ] || { warmup_sufficient=true; break; }
+        [ "${warmup_reqs}" -lt "${WARMUP_MIN_REQUESTS}" ] || { warmup_above_threshold=true; break; }
         echo "    누적 ${warmup_reqs}건 (기준 ${WARMUP_MIN_REQUESTS}). 더 돈다." >&2
       done
 
       if [ "${warmup_reqs}" -gt 0 ]; then
         # 기간은 그대로 남긴다. 값 집합 밖의 라벨을 새로 만들면 문서와 어긋나고,
         # "데워졌는가" 로 거르는 jq 필터가 그걸 웜으로 세거나 빠뜨린다.
-        # 충분했는지는 warmup_sufficient 가 따로 말한다.
+        # 충분했는지는 warmup_above_threshold 가 따로 말한다.
         warmed_by="${WARMUP_DURATION}"
         [ "${warmup_rounds}" -le 1 ] || warmed_by="${WARMUP_DURATION}x${warmup_rounds}"
         [ "${warmup_status}" -eq 0 ] || \
           echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
-        [ "${warmup_sufficient}" = true ] || \
+        [ "${warmup_above_threshold}" = true ] || \
           echo "경고: ${WARMUP_MAX_ROUNDS}회를 돌고도 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
       else
         echo "경고: 이 회차는 콜드로 기록한다." >&2
@@ -434,7 +438,7 @@ for mode in ${MODES}; do
       "WARMED_BY=${warmed_by}" \
       "WARMUP_REQUESTS=${warmup_reqs}" \
       "WARMUP_DRAIN_CAPPED=${warmup_capped}" \
-      "WARMUP_SUFFICIENT=${warmup_sufficient}" \
+      "WARMUP_ABOVE_THRESHOLD=${warmup_above_threshold}" \
       "${SCRIPT_DIR}/run.sh" || round_status=$?
 
     if [ "${round_status}" -ne 0 ]; then
@@ -476,7 +480,7 @@ find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/nu
                           then ((.load.warmup_requests / 1000) | floor | tostring) + "k"
                           else (.load.warmup_requests | tostring) end)
               else "" end)
-           + (if .load.warmup_sufficient == false and (.load.warmup_requests // 0) > 0
+           + (if .load.warmup_above_threshold == false and (.load.warmup_requests // 0) > 0
               then "?" else "" end)
            + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
           .violations]

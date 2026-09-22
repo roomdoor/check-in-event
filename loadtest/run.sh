@@ -110,7 +110,7 @@ WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 case "${WARMUP_REQUESTS}" in
   ''|*[!0-9]*) echo "WARMUP_REQUESTS 는 정수여야 한다. 받은 값: '${WARMUP_REQUESTS}'" >&2; exit 1 ;;
 esac
-for _name in WARMUP_DRAIN_CAPPED WARMUP_SUFFICIENT; do
+for _name in WARMUP_DRAIN_CAPPED WARMUP_ABOVE_THRESHOLD; do
   eval "_val=\${${_name}:-false}"
   case "${_val}" in
     true|false) eval "${_name}=\${_val}" ;;
@@ -358,7 +358,7 @@ jq -n \
   --arg warmed_by "${WARMED_BY:-unknown}" \
   --argjson warmup_requests "${WARMUP_REQUESTS}" \
   --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED}" \
-  --argjson warmup_sufficient "${WARMUP_SUFFICIENT}" \
+  --argjson warmup_above_threshold "${WARMUP_ABOVE_THRESHOLD}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
@@ -378,7 +378,9 @@ jq -n \
           pre_vus:$pre_vus, max_vus:$max_vus,
           # 이 회차 전에 앱을 데웠는지. 응답이 밀리초 단위라 그 차이가
           # 측정값보다 크다(README 5 장). 파일만 보고 알 수 있어야 한다.
-          #   "30s" 등  : 스윕이 그 길이만큼 데웠다
+          #   "30s"     : 스윕이 그 길이만큼 한 번 데웠다
+          #   "30sx3"   : 요청 수가 모자라 3회 반복했다. 낮은 rate 와 db 모드는
+          #               한 번으로 기준을 못 채워서 이 형태가 흔하다
           #   "none"    : 스윕이 데우려 했으나 부하가 안 나갔다 = 콜드
           #   "off"     : 워밍업을 끄고 일부러 콜드를 쟀다
           #   "unknown" : run.sh 를 손으로 돌렸다. 데웠는지는 돌린 사람만 안다
@@ -387,13 +389,18 @@ jq -n \
           warmed_by:$warmed_by,
           # 길이만으로는 충분히 데워졌는지 알 수 없다. 낮은 rate 에서 30초면
           # 요청이 몇 천 건뿐이라 C2 컴파일 문턱에 못 미친다. 그래서 실제로
-          # 나간 요청 수와, 그게 기준을 넘었는지를 같이 남긴다.
+          # 나간 요청 수와, 그게 설정한 기준을 넘었는지를 같이 남긴다.
+          #
+          # 이름이 'sufficient' 가 아닌 이유가 있다. 그 기준(기본 2만)은
+          # 검증된 값이 아니다 — 이 저장소에서 확인된 웜 상태는 38만 요청
+          # 뒤였고, 37만을 콜드로 받은 회차는 여전히 p95 1,474ms 였다.
+          # 넘었다고 해서 충분하다는 뜻이 아니라 '명백히 모자라지는 않다' 다.
           #
           # 웜 회차만 고르려면 warmed_by 만 보면 안 된다 —
           #   .load.warmed_by as $w | ($w != "off" and $w != "none"
-          #     and $w != "unknown" and .load.warmup_sufficient)
+          #     and $w != "unknown" and .load.warmup_above_threshold)
           warmup_requests:$warmup_requests,
-          warmup_sufficient:$warmup_sufficient,
+          warmup_above_threshold:$warmup_above_threshold,
           # 워밍업이 드레인 상한에 걸렸으면 본 회차가 시작될 때 드레이너가
           # 한가하지 않았다. 밀린 항목 자체는 상태 초기화가 스트림과 오프셋을
           # 지우므로 아래 drain.seconds 에 안 들어온다. 남는 영향은 드레이너
