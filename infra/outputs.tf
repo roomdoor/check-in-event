@@ -42,6 +42,12 @@ output "next_steps" {
        export REDIS_HOST=${module.bench.support_private_ip}
        export MYSQL_HOST=${module.bench.support_private_ip}
 
+       # MySQL root 비밀번호는 apply 마다 새로 생성된다. run.sh 기본값은
+       # 'root' 라 이걸 안 주면 사전 점검에서 접속 실패로 멈춘다.
+       export MYSQL_PASSWORD="$(aws ssm get-parameter --region ${module.bench.region} \
+         --name /${var.name_prefix}/db-password --with-decryption \
+         --query 'Parameter.Value' --output text)"
+
        MODE=redis RATE=400 DURATION=1m CAPACITY=10000 ./loadtest/run.sh
 
     3) 결과 회수 (로컬에서, destroy 전에 반드시)

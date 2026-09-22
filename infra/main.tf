@@ -1,5 +1,23 @@
 terraform {
   required_version = ">= 1.6"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# 프로바이더는 루트에서 설정한다. 모듈이 자기 provider 블록을 들고 있으면
+# 쓰는 쪽이 리전이나 프로파일을 못 바꾼다.
+#
+# 이게 없으면 var.region 은 모듈 입력으로만 쓰이고 프로바이더는 로컬 AWS
+# 설정을 따라간다. 그러면 리소스는 us-east-1 에 생기는데 user-data 안의
+# `aws ssm get-parameter --region ap-northeast-2` 는 엉뚱한 리전을 봐서
+# ParameterNotFound 로 부트스트랩이 죽는다.
+provider "aws" {
+  region = var.region
 }
 
 # 3호스트 뼈대는 k6-bench-kit 에서 온다 — VPC, 단일 AZ 고정, SSM, 결과 버킷,
@@ -14,7 +32,7 @@ module "bench" {
   #
   # 태그로 고정한다. ref=main 으로 두면 몇 주 뒤 apply 가 다른 모듈을 받아오고,
   # 그러면 같은 코드로 같은 인프라가 나온다는 보장이 사라진다.
-  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.1"
+  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.2"
 
   name_prefix = var.name_prefix
   region      = var.region

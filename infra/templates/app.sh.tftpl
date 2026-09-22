@@ -62,10 +62,13 @@ docker run -d --name app --network host \
 
 # 뜰 때까지 기다리고, 실패하면 왜 죽었는지 남긴다. 이게 없으면 SSM 이 "성공" 을
 # 돌려주고 오케스트레이터가 빈 회차를 측정한다.
+#
+# 읽기만 한다. 이벤트를 만들어 확인하면 측정 시작 전부터 DB 에 행이 남고,
+# 인스턴스를 다시 만들 때마다 하나씩 쌓인다. 404 든 200 이든 "앱이 HTTP 로
+# 응답한다" 는 사실은 같으므로 응답 코드를 받았는지만 본다.
 for _ in $(seq 1 90); do
-  if curl -sf -o /dev/null http://localhost:8080/api/events/1 \
-     || curl -sf -o /dev/null -X POST http://localhost:8080/api/events \
-          -H 'Content-Type: application/json' -d '{"name":"probe","capacity":1}'; then
+  if curl -s -o /dev/null -w '%%{http_code}' --max-time 3 \
+       http://localhost:8080/api/events/1 2>/dev/null | grep -qE '^[2345]'; then
     exit 0
   fi
   if ! docker ps --format '{{.Names}}' | grep -q '^app$'; then
@@ -79,12 +82,38 @@ echo "기동 시간 초과" >&2
 docker logs --tail 50 app >&2 2>&1 || true
 exit 1
 RUNNER
-chmod +x /usr/local/bin/app-run.sh
+# 비밀번호 쓰려고 걸어둔 umask 077 이 아직 살아있다. `chmod +x` 는 umask 에
+# 걸려 소유자 비트만 서므로 700 이 된다 — SSM Run Command 는 root 라 상관없지만
+# 세션으로 들어온 사람이 손으로 못 돌린다. 모드를 명시한다.
+chmod 755 /usr/local/bin/app-run.sh
 sed -i "s|__IMAGE__|${image}|" /usr/local/bin/app-run.sh
 
-# 여기서 띄우지는 않는다. 오케스트레이터가 회차마다 인자를 바꿔 띄운다.
+# B 호스트가 준비될 때까지 기다린다. 세 호스트는 병렬로 뜨고 depends_on 은
+# 생성 순서만 강제한다 — B 는 docker 설치, 이미지 pull, MySQL 최초 initdb 를
+# 거쳐야 하므로 A 보다 한참 늦다. 앱은 ddl-auto=update 라 기동 시 DB 연결이
+# 필요하고, 안 기다리면 아래 확인이 반드시 실패한다.
+for _ in $(seq 1 120); do
+  if (exec 3<>/dev/tcp/${support_host}/3306) 2>/dev/null; then
+    exec 3<&- 3>&-
+    break
+  fi
+  sleep 5
+done
+(exec 3<>/dev/tcp/${support_host}/3306) 2>/dev/null \
+  || { echo "B 호스트의 MySQL(3306)이 10분 안에 열리지 않았다" >&2; exit 1; }
+exec 3<&- 3>&- 2>/dev/null || true
+
+for _ in $(seq 1 60); do
+  if (exec 3<>/dev/tcp/${support_host}/6379) 2>/dev/null; then
+    exec 3<&- 3>&-
+    break
+  fi
+  sleep 5
+done
+
+# 여기서 띄워두지는 않는다. 오케스트레이터가 회차마다 인자를 바꿔 띄운다.
 # 다만 이미지가 실제로 뜨는지는 지금 확인해둔다 — 측정 시작하고 나서
-# 알게 되면 인스턴스를 다시 만들어야 한다.
+# 알게 되면 인스턴스를 다시 만들어야 하고, 그러면 앞선 회차 결과가 날아간다.
 /usr/local/bin/app-run.sh
 docker rm -f app >/dev/null 2>&1 || true
 
