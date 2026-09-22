@@ -32,7 +32,7 @@ module "bench" {
   #
   # 태그로 고정한다. ref=main 으로 두면 몇 주 뒤 apply 가 다른 모듈을 받아오고,
   # 그러면 같은 코드로 같은 인프라가 나온다는 보장이 사라진다.
-  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.4"
+  source = "git::ssh://git@github.com/roomdoor/k6-bench-kit.git//terraform?ref=v0.1.5"
 
   name_prefix = var.name_prefix
   region      = var.region
