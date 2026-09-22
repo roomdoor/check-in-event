@@ -56,13 +56,29 @@ output "next_steps" {
 
     3) 결과 회수 (로컬에서, destroy 전에 반드시)
 
-       DEST 를 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을 허용한다 —
-       로컬 회차와 섞이면 나중에 어느 쪽 수치였는지 알 수 없다.
+       받는 경로는 ec2/ 아래로 둘 것. .gitignore 가 그 경로만 커밋을
+       허용한다 — 로컬 회차와 섞이면 어느 쪽 수치였는지 알 수 없다.
 
+       REMOTE_RESULTS 는 이번에 돌린 것 하나만 가리킬 것. 그 마지막
+       디렉터리 이름이 버킷 안에서 이번 회차가 들어앉을 자리가 되고,
+       받을 때도 같은 자리만 본다. results 디렉터리를 통째로 주면 저장소에
+       커밋돼 clone 을 타고 호스트에 가 있는 지난 결과까지 다시 올라간다.
+
+       # 스윕이면 — config 이름이 그대로 자리 이름이 된다
        TF_DIR=infra \
-       REMOTE_RESULTS=/opt/check-in-event/loadtest/results \
-       DEST=./loadtest/results/ec2 \
+       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/compare \
+       DEST=./loadtest/results/ec2/compare \
          <k6-bench-kit>/scripts/fetch-results.sh
+
+       # 단발 회차면 run.sh 가 마지막에 찍어준 디렉터리 이름을 그대로 쓴다
+       TF_DIR=infra \
+       REMOTE_RESULTS=/opt/check-in-event/loadtest/results/<run_id> \
+       DEST=./loadtest/results/ec2/<run_id> \
+         <k6-bench-kit>/scripts/fetch-results.sh
+
+       빈 자리를 가리키면 스크립트가 멈추고 버킷에 실제로 있는 자리들을
+       보여준다. 0개를 받아놓고 정상으로 보인 채 destroy 로 넘어가는 일은
+       없다(kit v0.1.5).
 
     4) 커밋한 뒤
        terraform -chdir=infra destroy
