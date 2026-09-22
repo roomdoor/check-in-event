@@ -309,6 +309,7 @@ jq -n \
   --arg duration "${DURATION}" --arg dup_ratio "${DUP_RATIO}" \
   --arg violations "${violations}" \
   --arg base_url "${BASE_URL}" --arg redis_host "${REDIS_HOST}" --arg mysql_host "${MYSQL_HOST}" \
+  --arg warmed_by "${WARMED_BY:-none}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
@@ -325,7 +326,11 @@ jq -n \
     # 무엇이 병목인지 구분되지 않아 쓸 수 없다. 파일만 보고 알 수 있어야 한다.
     where:{base_url:$base_url, redis_host:$redis_host, mysql_host:$mysql_host},
     load:{rate:$rate, duration:$duration, dup_ratio:$dup_ratio,
-          pre_vus:$pre_vus, max_vus:$max_vus},
+          pre_vus:$pre_vus, max_vus:$max_vus,
+          # 이 회차 전에 앱을 데웠는지. "none" 이면 갓 뜬 JVM 을 잰 것이다.
+          # 응답이 밀리초 단위라 그 차이가 측정값보다 크다(README 5 장).
+          # 파일만 보고 어느 쪽인지 알 수 있어야 한다.
+          warmed_by:$warmed_by},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},

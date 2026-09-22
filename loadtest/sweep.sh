@@ -46,6 +46,11 @@ DUP_RATIO="${DUP_RATIO:-0}"
 # 버티므로 문제가 안 된다. 회차마다 그만큼 길어진다는 것만 감안하면 된다.
 WARMUP_DURATION="${WARMUP_DURATION:-30s}"
 
+# 워밍업 회차의 드레인 대기 상한. 본 회차 값을 물려받으면 안 된다 — 과부하
+# 회차용으로 크게 잡아둔 값(예: 1800)을 워밍업이 쓰면, 출력이 버려진 채로
+# 회차당 30분을 설 수 있다. 워밍업은 밀려도 버릴 회차라 짧게 끊는다.
+WARMUP_DRAIN_CAP_SECONDS="${WARMUP_DRAIN_CAP_SECONDS:-120}"
+
 # 앱을 재기동할 대상. 부트스트랩이 /etc/profile.d/bench.sh 에 심어둔다.
 SUT_INSTANCE_ID="${SUT_INSTANCE_ID:?SUT_INSTANCE_ID 가 필요하다. /etc/profile.d/bench.sh 를 source 했는지 확인할 것}"
 AWS_REGION="${AWS_REGION:?AWS_REGION 이 필요하다}"
@@ -57,8 +62,9 @@ SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
 
 # 워밍업 회차가 결과를 쓰는 자리. SWEEP_ROOT 밖에 둔다 — 안에 두면 끝에
 # 표를 만들 때 같이 세어지고, S3 로도 올라간다.
+# 실제 생성은 검증을 통과한 뒤에 한다(아래).
 warmup_root="${RESULTS_ROOT}/.warmup"
-mkdir -p "${warmup_root}"
+warmup_log="${RESULTS_ROOT}/.warmup.log"
 
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
@@ -80,12 +86,17 @@ case "${DURATION}" in
   *[0-9]s|*[0-9]m|*[0-9]h) ;;
   *) echo "DURATION 은 30s, 1m, 1h 형태여야 한다. 받은 값: '${DURATION}'" >&2; exit 1 ;;
 esac
-# 워밍업도 같은 형태여야 한다. 여기서 안 걸러도 워밍업은 실패를 무시하므로,
-# 잘못된 값이면 데우지 않은 채 조용히 모든 회차를 콜드로 잰다.
-case "${WARMUP_DURATION}" in
-  0|*[0-9]s|*[0-9]m|*[0-9]h) ;;
-  *) echo "WARMUP_DURATION 은 0 또는 30s, 1m 형태여야 한다. 받은 값: '${WARMUP_DURATION}'" >&2; exit 1 ;;
+# 워밍업도 같은 형태여야 한다. 잘못된 값이면 데우지 않은 채 모든 회차를
+# 콜드로 재게 되는데, 그게 이 코드가 막으려는 상태다.
+#
+# 끄는 값을 여기서 한 번에 정규화한다. '0s' 같은 값이 형식 검사는 통과하면서
+# "0 이 아니다" 로 분기하면, 끈 줄 알고 있는데 k6 가 0초 부하를 거부하고
+# 그 실패가 회차마다 반복된다.
+_warmup_num="${WARMUP_DURATION%[smh]}"
+case "${_warmup_num}" in
+  ''|*[!0-9]*) echo "WARMUP_DURATION 은 0 또는 30s, 1m 형태여야 한다. 받은 값: '${WARMUP_DURATION}'" >&2; exit 1 ;;
 esac
+if [ "${_warmup_num}" -eq 0 ]; then warmup_on=false; else warmup_on=true; fi
 for _list_name in RATES WRITER_BATCH_SIZES WRITER_DELAYS; do
   eval "_list=\${${_list_name}}"
   for _v in ${_list}; do
@@ -159,6 +170,9 @@ app_restart() {
 }
 
 mkdir -p "${SWEEP_ROOT}"
+# 검증을 통과한 뒤에 만든다. 위에 두면 설정이 틀려 멈춘 실행도 .warmup/ 을
+# 남긴다.
+[ "${warmup_on}" = false ] || mkdir -p "${warmup_root}"
 
 total=0
 failed=0
@@ -235,17 +249,33 @@ for mode in ${MODES}; do
     #
     # 콜드 상태를 일부러 재려면 WARMUP_DURATION=0 으로 끈다. 배포나
     # 스케일아웃 중에 피크가 오는 상황이 그쪽이다.
-    if [ "${WARMUP_DURATION}" != "0" ]; then
+    warmed_by=none
+    if [ "${warmup_on}" = true ]; then
       echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
+      warmup_status=0
+      # 출력은 버리되 실패는 알린다. 조용히 넘어가면 워밍업이 매 회차 깨진 채로
+      # 스윕이 끝나고, 그건 이 코드가 막으려는 상태(콜드 측정) 그대로다.
+      #
+      # 드레인 상한은 따로 짧게 준다. round_env 의 값을 물려받으면(ceiling.env 는
+      # 1800) 워밍업이 드레이너를 밀었을 때 회차당 30분을 아무 출력 없이 선다.
       env "${round_env[@]}" \
         "DURATION=${WARMUP_DURATION}" \
         "RESULTS_ROOT=${warmup_root}" \
-        "${SCRIPT_DIR}/run.sh" >/dev/null 2>&1 || true
+        "DRAIN_CAP_SECONDS=${WARMUP_DRAIN_CAP_SECONDS}" \
+        "${SCRIPT_DIR}/run.sh" >"${warmup_log}" 2>&1 || warmup_status=$?
+      if [ "${warmup_status}" -ne 0 ]; then
+        echo "경고: 워밍업이 ${warmup_status} 로 끝났다. 이 회차는 데워지지 않았을 수 있다." >&2
+        tail -5 "${warmup_log}" >&2
+      else
+        warmed_by="${WARMUP_DURATION}"
+      fi
       rm -rf "${warmup_root:?}"/*
     fi
 
     round_status=0
-    env "${round_env[@]}" "${SCRIPT_DIR}/run.sh" || round_status=$?
+    # 데웠는지를 result.json 에 남긴다. 안 남기면 커밋된 결과만 보고
+    # 콜드인지 웜인지 구분할 수 없다 — 이 저장소가 실제로 그래서 헤맸다.
+    env "${round_env[@]}" "WARMED_BY=${warmed_by}" "${SCRIPT_DIR}/run.sh" || round_status=$?
 
     if [ "${round_status}" -ne 0 ]; then
       echo "회차가 불변식 위반으로 끝났다 (종료코드 ${round_status}): ${label}" >&2
