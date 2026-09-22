@@ -110,11 +110,13 @@ WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 case "${WARMUP_REQUESTS}" in
   ''|*[!0-9]*) echo "WARMUP_REQUESTS 는 정수여야 한다. 받은 값: '${WARMUP_REQUESTS}'" >&2; exit 1 ;;
 esac
-WARMUP_DRAIN_CAPPED="${WARMUP_DRAIN_CAPPED:-false}"
-case "${WARMUP_DRAIN_CAPPED}" in
-  true|false) ;;
-  *) echo "WARMUP_DRAIN_CAPPED 는 true 또는 false 여야 한다. 받은 값: '${WARMUP_DRAIN_CAPPED}'" >&2; exit 1 ;;
-esac
+for _name in WARMUP_DRAIN_CAPPED WARMUP_SUFFICIENT; do
+  eval "_val=\${${_name}:-false}"
+  case "${_val}" in
+    true|false) eval "${_name}=\${_val}" ;;
+    *) echo "${_name} 은 true 또는 false 여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
+  esac
+done
 
 command -v k6 >/dev/null || { echo "k6 가 없다." >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq 가 없다." >&2; exit 1; }
@@ -156,7 +158,22 @@ redis_cmd DEL "event:${EVENT_ID}:users" "event:${EVENT_ID}:count" "event:${EVENT
 # 측정 대상이라 그 위에 퍼지 부하를 얹으면 안 된다.
 # check_ins 는 events 를 참조하는 쪽이고 이를 참조하는 테이블이 없어 TRUNCATE 가
 # 허용된다(참조당하는 테이블이면 MySQL 이 거부한다).
-mysql_query "TRUNCATE TABLE check_ins;" >/dev/null
+#
+# 바꾸면서 생기는 차이 둘을 막아둔다.
+#   - TRUNCATE 는 메타데이터 락을 기다리는데 lock_wait_timeout 기본값이
+#     1년이다. 워밍업 직후라 드레이너가 아직 INSERT 중일 수 있고, 그러면
+#     몇 시간짜리 스윕이 여기서 조용히 선다. 60초로 끊는다.
+#   - TRUNCATE 는 DROP 권한을 요구한다(DELETE 는 DELETE 권한이면 됐다).
+#     MYSQL_USER 를 최소 권한 계정으로 바꾸면 여기서 막힌다.
+mysql_query "SET SESSION lock_wait_timeout = 60; TRUNCATE TABLE check_ins;" >/dev/null
+# mysql_query 가 stderr 를 버리므로 실패해도 조용하다. 비었는지 직접 확인한다.
+_left="$(mysql_query "SELECT COUNT(*) FROM check_ins;")"
+case "${_left}" in
+  0) ;;
+  *) echo "상태 초기화 실패: check_ins 가 안 비었다(남은 행 '${_left}')." >&2
+     echo "       TRUNCATE 에는 DROP 권한이 필요하다. MYSQL_USER=${MYSQL_USER} 확인할 것." >&2
+     exit 1 ;;
+esac
 mysql_query "UPDATE events SET accepted_count = 0;" >/dev/null
 
 run_id="${MODE}-rate${RATE}-dup${DUP_RATIO}-$(date +%Y%m%d-%H%M%S)"
@@ -333,6 +350,7 @@ jq -n \
   --arg warmed_by "${WARMED_BY:-unknown}" \
   --argjson warmup_requests "${WARMUP_REQUESTS}" \
   --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED}" \
+  --argjson warmup_sufficient "${WARMUP_SUFFICIENT}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
@@ -361,9 +379,13 @@ jq -n \
           warmed_by:$warmed_by,
           # 길이만으로는 충분히 데워졌는지 알 수 없다. 낮은 rate 에서 30초면
           # 요청이 몇 천 건뿐이라 C2 컴파일 문턱에 못 미친다. 그래서 실제로
-          # 나간 요청 수를 같이 남긴다 — 이 숫자가 작으면 웜이라고 적혀 있어도
-          # 지연 수치를 믿으면 안 된다.
+          # 나간 요청 수와, 그게 기준을 넘었는지를 같이 남긴다.
+          #
+          # 웜 회차만 고르려면 warmed_by 만 보면 안 된다 —
+          #   .load.warmed_by as $w | ($w != "off" and $w != "none"
+          #     and $w != "unknown" and .load.warmup_sufficient)
           warmup_requests:$warmup_requests,
+          warmup_sufficient:$warmup_sufficient,
           # 워밍업이 드레인 상한에 걸렸으면 본 회차가 시작될 때 드레이너가
           # 한가하지 않았다. 아래 drain.seconds 에 워밍업 잔량이 섞인다.
           warmup_drain_capped:$warmup_drain_capped},

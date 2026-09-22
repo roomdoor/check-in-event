@@ -81,7 +81,7 @@ SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
 # config 이름을 붙여 스윕끼리 자리를 안 겹치게 한다.
 #
 # 그렇다고 두 스윕을 동시에 돌릴 수 있다는 뜻은 아니다 — run.sh 의 상태
-# 초기화가 DB·Redis 를 전역으로 비우므로(스트림 DEL, check_ins DELETE,
+# 초기화가 DB·Redis 를 전역으로 비우므로(스트림 DEL, check_ins TRUNCATE,
 # accepted_count 0) 어차피 서로를 망가뜨린다. 여기 이름을 나누는 건
 # 지난 실행의 잔재를 이번 실행이 읽지 않게 하려는 것이다.
 warmup_root="${RESULTS_ROOT}/.warmup-${CONFIG_NAME}"
@@ -216,7 +216,11 @@ mkdir -p "${SWEEP_ROOT}"
 # RESULTS_ROOT 아래에 있어 결과를 회수할 때 같이 딸려간다. 기본 경로
 # (loadtest/results/)에서는 .gitignore 가 직계 자식을 막아주지만,
 # RESULTS_ROOT 를 ec2/ 안으로 두고 돌리면 그 보호가 없다.
-trap '[ "${warmup_on}" = false ] || rm -rf "${warmup_root:?}"' EXIT
+trap 'rm -rf "${warmup_root:?}"' EXIT
+
+# 시작할 때도 비운다. trap 을 건너뛰는 종료(kill -9, 인스턴스 정지)가 있으면
+# 남고, 워밍업을 끈 설정으로 다음 스윕을 돌리면 아무도 안 치운다.
+rm -rf "${warmup_root:?}"
 
 total=0
 failed=0
@@ -301,6 +305,7 @@ for mode in ${MODES}; do
     warmed_by=off
     warmup_reqs=0
     warmup_capped=false
+    warmup_sufficient=false
     if [ "${warmup_on}" = true ]; then
       warmed_by=none
       echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
@@ -335,16 +340,19 @@ for mode in ${MODES}; do
       case "${warmup_reqs}" in ''|*[!0-9]*) warmup_reqs=0 ;; esac
       case "${warmup_capped}" in true) ;; *) warmup_capped=false ;; esac
 
-      if [ "${warmup_reqs}" -ge "${WARMUP_MIN_REQUESTS}" ]; then
+      if [ "${warmup_reqs}" -gt 0 ]; then
+        # 기간은 그대로 남긴다. 값 집합 밖의 라벨을 새로 만들면 문서와 어긋나고,
+        # "데워졌는가" 로 거르는 jq 필터가 그걸 웜으로 세거나 빠뜨린다.
+        # 충분했는지는 아래 warmup_sufficient 가 따로 말한다.
         warmed_by="${WARMUP_DURATION}"
         [ "${warmup_status}" -eq 0 ] || \
           echo "워밍업이 ${warmup_status} 로 끝났지만 요청 ${warmup_reqs}건이 나갔다. 데워진 것으로 본다." >&2
-      elif [ "${warmup_reqs}" -gt 0 ]; then
-        # 부하는 갔는데 양이 모자란다. 낮은 rate 에서 30초면 몇 천 건뿐이라
-        # HotSpot 이 C2 까지 안 올라간다. "데웠다" 로 적으면 거의 콜드인 회차를
-        # 웜으로 라벨링하는 것이라, 길이 대신 실제 양을 남긴다.
-        warmed_by="partial"
-        echo "경고: 워밍업 요청이 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 부분 워밍으로 기록한다." >&2
+        if [ "${warmup_reqs}" -ge "${WARMUP_MIN_REQUESTS}" ]; then
+          warmup_sufficient=true
+        else
+          # 낮은 rate 에서 30초면 몇 천 건뿐이라 HotSpot 이 C2 까지 안 올라간다.
+          echo "경고: 워밍업 요청이 ${warmup_reqs}건뿐이다(기준 ${WARMUP_MIN_REQUESTS}). 덜 데워진 회차로 기록한다." >&2
+        fi
       else
         echo "경고: 워밍업에서 부하가 나가지 않았다(종료코드 ${warmup_status}). 이 회차는 콜드로 기록한다." >&2
         tail -5 "${warmup_log}" >&2
@@ -396,6 +404,7 @@ for mode in ${MODES}; do
       "WARMED_BY=${warmed_by}" \
       "WARMUP_REQUESTS=${warmup_reqs}" \
       "WARMUP_DRAIN_CAPPED=${warmup_capped}" \
+      "WARMUP_SUFFICIENT=${warmup_sufficient}" \
       "${SCRIPT_DIR}/run.sh" || round_status=$?
 
     if [ "${round_status}" -ne 0 ]; then
@@ -437,6 +446,8 @@ find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/nu
                           then ((.load.warmup_requests / 1000) | floor | tostring) + "k"
                           else (.load.warmup_requests | tostring) end)
               else "" end)
+           + (if .load.warmup_sufficient == false and (.load.warmup_requests // 0) > 0
+              then "?" else "" end)
            + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
           .violations]
          | @tsv' "$f" 2>/dev/null \
