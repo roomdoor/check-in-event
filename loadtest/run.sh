@@ -310,6 +310,8 @@ jq -n \
   --arg violations "${violations}" \
   --arg base_url "${BASE_URL}" --arg redis_host "${REDIS_HOST}" --arg mysql_host "${MYSQL_HOST}" \
   --arg warmed_by "${WARMED_BY:-unknown}" \
+  --argjson warmup_requests "${WARMUP_REQUESTS:-0}" \
+  --argjson warmup_drain_capped "${WARMUP_DRAIN_CAPPED:-false}" \
   --argjson pre_vus "${PRE_VUS}" --argjson max_vus "${MAX_VUS}" \
   --argjson event_id "${EVENT_ID}" --argjson rate "${RATE}" \
   --argjson capacity "${evt_capacity:-0}" --argjson accepted_count "${evt_accepted:-0}" \
@@ -331,10 +333,19 @@ jq -n \
           # 측정값보다 크다(README 5 장). 파일만 보고 알 수 있어야 한다.
           #   "30s" 등  : 스윕이 그 길이만큼 데웠다
           #   "none"    : 스윕이 데우려 했으나 부하가 안 나갔다 = 콜드
+          #   "off"     : 워밍업을 끄고 일부러 콜드를 쟀다
           #   "unknown" : run.sh 를 손으로 돌렸다. 데웠는지는 돌린 사람만 안다
           # unknown 을 none 과 합치면 안 된다 — 이 저장소의 유일한 웜 측정이
           # 손으로 돌린 것이라, 합치면 그게 콜드로 기록된다.
-          warmed_by:$warmed_by},
+          warmed_by:$warmed_by,
+          # 길이만으로는 충분히 데워졌는지 알 수 없다. 낮은 rate 에서 30초면
+          # 요청이 몇 천 건뿐이라 C2 컴파일 문턱에 못 미친다. 그래서 실제로
+          # 나간 요청 수를 같이 남긴다 — 이 숫자가 작으면 웜이라고 적혀 있어도
+          # 지연 수치를 믿으면 안 된다.
+          warmup_requests:$warmup_requests,
+          # 워밍업이 드레인 상한에 걸렸으면 본 회차가 시작될 때 드레이너가
+          # 한가하지 않았다. 아래 drain.seconds 에 워밍업 잔량이 섞인다.
+          warmup_drain_capped:$warmup_drain_capped},
     writer:{batch_size:$writer_batch, delay_ms:$writer_delay},
     event:{capacity:$capacity, accepted_count:$accepted_count},
     db:{accepted:$db_accepted, rejected:$db_rejected, total:$db_total, duplicate_keys:$db_dup_keys},

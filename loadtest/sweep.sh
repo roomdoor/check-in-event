@@ -195,6 +195,12 @@ mkdir -p "${SWEEP_ROOT}"
 # 남긴다.
 # 워밍업 자리는 회차마다 쓰기 직전에 만든다(아래). 여기서는 만들지 않는다 —
 # 스윕이 워밍업 없이 끝나면 빈 디렉터리조차 남기지 않는다.
+#
+# 어떻게 끝나든 지운다. Ctrl-C, SSH 끊김, set -e 중단 어느 쪽이든 남으면
+# RESULTS_ROOT 아래에 있어 결과를 회수할 때 같이 딸려간다. 기본 경로
+# (loadtest/results/)에서는 .gitignore 가 직계 자식을 막아주지만,
+# RESULTS_ROOT 를 ec2/ 안으로 두고 돌리면 그 보호가 없다.
+trap '[ "${warmup_on}" = false ] || rm -rf "${warmup_root:?}"' EXIT
 
 total=0
 failed=0
@@ -271,8 +277,13 @@ for mode in ${MODES}; do
     #
     # 콜드 상태를 일부러 재려면 WARMUP_DURATION=0 으로 끈다. 배포나
     # 스케일아웃 중에 피크가 오는 상황이 그쪽이다.
-    warmed_by=none
+    # 워밍업을 아예 끈 것과, 돌렸는데 부하가 안 나간 것은 다른 상태다.
+    # ceiling-narrow.env 처럼 일부러 콜드를 재는 설정이 있어서 구분이 필요하다.
+    warmed_by=off
+    warmup_reqs=0
+    warmup_capped=false
     if [ "${warmup_on}" = true ]; then
+      warmed_by=none
       echo "==> 워밍업 ${WARMUP_DURATION} (결과는 버린다)"
       # 쓰기 전에 비운다. 뒤에서 비우면, 지난 스윕이 워밍업 직후에 죽었을 때
       # 남은 result.json 을 이번 첫 회차가 읽고 "데워졌다" 로 판단한다.
@@ -295,12 +306,15 @@ for mode in ${MODES}; do
       # 걸리는 건(드레인미완) 흔하고 JVM 은 이미 데워진 상태다. 종료코드로
       # 정하면 그 회차가 warmed_by=none 으로 기록되어, 데운 회차를 콜드로
       # 라벨링한다 — 이 코드가 막으려는 실수의 반대 방향이다.
-      warmup_reqs=0
-      warmup_result="$(find "${warmup_root}" -name result.json -print -quit 2>/dev/null)"
+      # set -e 아래에서 find 가 0 이 아닌 상태로 끝나면 대입이 그대로 스윕을
+      # 죽인다. 몇 시간짜리가 요약도 S3 업로드도 없이 끝난다.
+      warmup_result="$(find "${warmup_root}" -name result.json -print -quit 2>/dev/null)" || warmup_result=""
       if [ -n "${warmup_result}" ]; then
         warmup_reqs="$(jq -r '.k6.requests // 0' "${warmup_result}" 2>/dev/null)" || warmup_reqs=0
+        warmup_capped="$(jq -r '.drain.capped // false' "${warmup_result}" 2>/dev/null)" || warmup_capped=false
       fi
       case "${warmup_reqs}" in ''|*[!0-9]*) warmup_reqs=0 ;; esac
+      case "${warmup_capped}" in true) ;; *) warmup_capped=false ;; esac
 
       if [ "${warmup_reqs}" -gt 0 ]; then
         warmed_by="${WARMUP_DURATION}"
@@ -311,6 +325,17 @@ for mode in ${MODES}; do
         tail -5 "${warmup_log}" >&2
       fi
 
+      # 워밍업이 드레인 상한에 걸렸으면 드레이너가 아직 일하는 중이다.
+      # 본 회차의 상태 초기화가 그 위에서 돌고, 드레인 타이머도 한가하지 않은
+      # 드레이너를 상대로 시작한다 — 드레이너 처리량 수치가 바로 그 타이머에서
+      # 나오므로 그냥 넘어가면 안 된다. 더 기다리고, 결과에도 남긴다.
+      warmup_settle="${WARMUP_SETTLE_SECONDS}"
+      if [ "${warmup_capped}" = true ]; then
+        warmup_settle=$(( WARMUP_SETTLE_SECONDS * 6 ))
+        echo "경고: 워밍업이 드레인 상한(${WARMUP_DRAIN_CAP_SECONDS}s)에 걸렸다." >&2
+        echo "      ${warmup_settle}s 더 기다린다. 이 회차의 드레인 수치는 워밍업 잔량이 섞였을 수 있다." >&2
+      fi
+
       # 워밍업이 남긴 일이 끝나기를 기다린다.
       #
       # 재기동 직후에는 진행 중인 작업이 없었지만, 이제 본 회차가 워밍업
@@ -318,13 +343,17 @@ for mode in ${MODES}; do
       # 비어 있지만, db 모드는 드레인 단계 자체가 없다 — 워밍업의 마지막
       # 트랜잭션들이 events 행 락을 쥔 채로 본 회차의 상태 초기화와
       # 첫 부하에 겹친다.
-      sleep "${WARMUP_SETTLE_SECONDS}"
+      sleep "${warmup_settle}"
     fi
 
     round_status=0
     # 데웠는지를 result.json 에 남긴다. 안 남기면 커밋된 결과만 보고
     # 콜드인지 웜인지 구분할 수 없다 — 이 저장소가 실제로 그래서 헤맸다.
-    env "${round_env[@]}" "WARMED_BY=${warmed_by}" "${SCRIPT_DIR}/run.sh" || round_status=$?
+    env "${round_env[@]}" \
+      "WARMED_BY=${warmed_by}" \
+      "WARMUP_REQUESTS=${warmup_reqs}" \
+      "WARMUP_DRAIN_CAPPED=${warmup_capped}" \
+      "${SCRIPT_DIR}/run.sh" || round_status=$?
 
     if [ "${round_status}" -ne 0 ]; then
       echo "회차가 불변식 위반으로 끝났다 (종료코드 ${round_status}): ${label}" >&2
@@ -369,10 +398,6 @@ if [ -n "${RESULTS_BUCKET:-}" ]; then
 fi
 
 echo
-# 워밍업 자리는 남기지 않는다. RESULTS_ROOT 아래라 결과를 회수할 때
-# 같이 딸려가고, .gitignore 가 ec2/ 아래를 통째로 되살리므로 커밋된다.
-[ "${warmup_on}" = false ] || rm -rf "${warmup_root:?}"
-
 echo "결과: ${SWEEP_ROOT}"
 echo "시작: ${started_at}  종료: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
