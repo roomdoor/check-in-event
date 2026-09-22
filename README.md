@@ -63,22 +63,28 @@ k6 지표로 돌아온다.
 
 하나라도 깨지면 종료코드 1 이다.
 
-| 항목 | 조건 |
+| 위반 이름 | 조건 |
 | --- | --- |
-| 부하 도달 | k6 요청 > 0, 요청이 갔는데 저장 0건이 아닐 것 |
-| 드레인 완료 | 상한에 걸리지 않았을 것 |
-| 초과 승인 | 저장된 승인 행 ≤ 정원, Redis 카운터 ≤ 정원 |
-| Redis 내부 정합 | `count` == `SCARD users` == `HLEN pos` |
-| Redis–DB 일치 | Redis 카운터 == 저장된 승인 행 |
-| 카운터 정합 | `events.accepted_count` == 저장된 승인 행 |
-| 중복 행 | `(event_id, participant_key)` 중복 0 |
-| 중복 발생 | `DUP_RATIO > 0` 이면 재사용이 실제로 나갔을 것 |
+| `부하없음` / `저장없음` | k6 요청 > 0, 요청이 갔는데 저장 0건이 아닐 것 |
+| `집계실패` | 집계 쿼리가 숫자를 돌려줬을 것 |
+| `드레인미완` | 드레인이 상한에 걸리지 않았을 것 |
+| `초과승인` / `초과승인_redis` / `초과승인_카운터` | 저장된 승인 행·Redis 카운터·`accepted_count` 각각 ≤ 정원 |
+| `Redis내부불일치` | `count` == `SCARD users` |
+| `순번누락` | `SCARD users` == `HLEN pos` |
+| `Redis-DB불일치` | Redis 카운터 == 저장된 승인 행 |
+| `카운터불일치` | `events.accepted_count` == 저장된 승인 행 |
+| `중복행` | `(event_id, participant_key)` 중복 0 |
+| `중복미발생` | `DUP_RATIO > 0` 이면 재사용이 실제로 나갔을 것 |
 
 첫 줄이 제일 중요하다. **아무 일도 안 일어난 회차는 나머지 검사가 전부
 0끼리 비교라 저절로 통과한다.** 앱이 요청마다 500을 뱉어도 "위반 없음" 이
 나오던 것을 이 검사로 막는다.
 
 ### 실행
+
+필요한 도구: **k6, jq** (없으면 `run.sh` 가 시작 전에 멈춘다).
+MySQL·Redis 를 원격으로 볼 때는 `mysql`·`redis-cli` 클라이언트도 있어야 한다 —
+없으면 로컬 컨테이너를 보게 되므로 `run.sh` 가 그것도 막는다.
 
 ```bash
 docker compose up -d                     # MySQL + Redis
@@ -87,13 +93,17 @@ docker compose up -d                     # MySQL + Redis
 MODE=redis RATE=400 DURATION=20s CAPACITY=1000 DUP_RATIO=0.2 ./loadtest/run.sh
 ```
 
-| 변수 | 뜻 |
-| --- | --- |
-| `MODE` | `db` 또는 `redis` |
-| `RATE` | 초당 요청 수 |
-| `CAPACITY` | 이벤트 정원 |
-| `DUP_RATIO` | 같은 참가자가 다시 누르는 비율 (0~1) |
-| `WRITER_BATCH_SIZE`, `WRITER_DELAY_MS` | 앱 기동 인자와 같게 줄 것. 결과에 기록만 한다 |
+| 변수 | 기본값 | 뜻 |
+| --- | --- | --- |
+| `MODE` | `db` | `db` 또는 `redis` |
+| `RATE` | 2000 | 초당 요청 수 |
+| `DURATION` | 1m | 부하 시간 |
+| `CAPACITY` | 10000 | 이벤트 정원 |
+| `DUP_RATIO` | 0 | 같은 참가자가 다시 누르는 비율. `0`, `1`, 소수점 둘째 자리까지 (`0.1`, `0.25`) |
+| `PRE_VUS` / `MAX_VUS` | 50 / 200 | k6 VU 수 |
+| `DRAIN_CAP_SECONDS` | 600 | 드레인 대기 상한 |
+| `WRITER_BATCH_SIZE` / `WRITER_DELAY_MS` | 200 / 500 | 앱 기동 인자와 같게 줄 것. 결과에 기록만 한다 |
+| `BASE_URL` | `http://localhost:8080` | |
 
 결과는 `loadtest/results/<run_id>/result.json` 에 조건과 함께 남는다.
 
@@ -109,10 +119,12 @@ MODE=redis RATE=400 DURATION=20s CAPACITY=1000 DUP_RATIO=0.2 ./loadtest/run.sh
 거절은 응답으로 알려주고 끝낸다. **두 방식 모두** 그렇게 맞췄다 — 한쪽만
 바꾸면 서로 다른 양의 일을 하게 되어 처리량 비교가 다시 무의미해진다.
 
-거절된 응답은 저장된 행이 없으므로 `id` 가 `null` 이다.
+DB 경로는 저장된 행이 없으므로 응답의 `id` 가 `null` 이 된다. Redis 경로는
+원래 `id` 를 주지 않는다(`position`·`duplicate`·`persisted` 를 준다).
 
 ```json
-{"id": null, "eventId": 1, "participantKey": "u-1", "result": "REJECTED", ...}
+DB    {"id": null, "eventId": 1, "participantKey": "u-1", "result": "REJECTED", ...}
+Redis {"eventId": 1, "participantKey": "u-1", "result": "REJECTED", "position": null, ...}
 ```
 
 ### Lua 를 쓰는 이유
@@ -151,9 +163,12 @@ update events e
   측정값이 아니라 도구가 동작하는지 확인한 것이다
 - **Redis 스트림에 XTRIM 이 없다.** 거절 저장을 없애 증식 속도는 크게 줄었지만
   여전히 무한히 자란다
-- **`카운터불일치` 검사가 앱과 같은 쿼리를 비교한다.** 찢어진 쓰기는 잡지만
-  카운터 로직 결함은 못 잡는다. Redis 모드는 `Redis-DB불일치` 가 그 자리를
-  덮지만 DB 모드는 덮는 검사가 없다
+- **Redis 모드에서 `카운터불일치` 검사가 사실상 통과가 보장돼 있다.**
+  `syncAcceptedCount` 가 `run.sh` 의 비교 대상과 **같은 `COUNT(*)` 쿼리**로
+  `accepted_count` 를 쓰기 때문이다. 찢어진 쓰기는 잡지만 카운터 로직 결함은
+  못 잡는다 — 다만 그 자리는 `Redis-DB불일치` 가 덮는다.
+  DB 모드는 `CheckInService` 가 `acceptedCount += 1` 로 따로 세므로 이 검사가
+  실제로 의미가 있다
 - **Redis 가 죽으면** 아직 DB 로 안 넘어간 체크인이 사라진다. 복제본이 없다
 
 ---
