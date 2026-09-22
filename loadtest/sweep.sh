@@ -51,9 +51,14 @@ WARMUP_DURATION="${WARMUP_DURATION:-30s}"
 # 회차당 30분을 설 수 있다. 워밍업은 밀려도 버릴 회차라 짧게 끊는다.
 WARMUP_DRAIN_CAP_SECONDS="${WARMUP_DRAIN_CAP_SECONDS:-120}"
 
-# 워밍업이 끝나고 본 회차를 시작하기까지 쉬는 시간. db 모드는 드레인 대기가
-# 없어서 워밍업의 마지막 트랜잭션이 본 회차 첫 구간과 겹칠 수 있다.
+# 워밍업이 끝나고 본 회차를 시작하기까지 쉬는 시간.
+#
+# redis 는 run.sh 가 드레인까지 기다려준 뒤라 짧아도 된다.
 WARMUP_SETTLE_SECONDS="${WARMUP_SETTLE_SECONDS:-5}"
+
+# db 는 드레인 단계가 없어서 워밍업의 마지막 트랜잭션이 아직 events 행 락을
+# 쥐고 있을 수 있다. 그 위에서 본 회차의 상태 초기화와 첫 부하가 돈다.
+WARMUP_DB_SETTLE_SECONDS="${WARMUP_DB_SETTLE_SECONDS:-30}"
 
 # 앱을 재기동할 대상. 부트스트랩이 /etc/profile.d/bench.sh 에 심어둔다.
 SUT_INSTANCE_ID="${SUT_INSTANCE_ID:?SUT_INSTANCE_ID 가 필요하다. /etc/profile.d/bench.sh 를 source 했는지 확인할 것}"
@@ -67,14 +72,19 @@ SWEEP_ROOT="${RESULTS_ROOT}/${CONFIG_NAME}"
 # 워밍업 회차가 결과를 쓰는 자리. SWEEP_ROOT 밖에 둔다 — 안에 두면 끝에
 # 표를 만들 때 같이 세어지고, S3 로도 올라간다.
 # 실제 생성은 검증을 통과한 뒤에 한다(아래).
-# config 이름을 붙인다. 한 호스트에서 두 스윕을 동시에 돌리면, 자리를 공유할
-# 경우 서로의 result.json 을 읽고 서로의 출력을 지운다.
+# config 이름을 붙여 스윕끼리 자리를 안 겹치게 한다.
+#
+# 그렇다고 두 스윕을 동시에 돌릴 수 있다는 뜻은 아니다 — run.sh 의 상태
+# 초기화가 DB·Redis 를 전역으로 비우므로(스트림 DEL, check_ins DELETE,
+# accepted_count 0) 어차피 서로를 망가뜨린다. 여기 이름을 나누는 건
+# 지난 실행의 잔재를 이번 실행이 읽지 않게 하려는 것이다.
 warmup_root="${RESULTS_ROOT}/.warmup-${CONFIG_NAME}"
 warmup_log="${warmup_root}/sweep-warmup.log"
 
 # 몇 시간짜리 스윕이 끝난 뒤 jq 단계에서 죽는 걸 막는다. run.sh 도 같은 이유로
 # 자기 입력을 먼저 검사하는데, 여기서 걸러야 첫 회차 전에 멈춘다.
-for _name in REPEATS CAPACITY APP_START_TIMEOUT WARMUP_DRAIN_CAP_SECONDS WARMUP_SETTLE_SECONDS; do
+for _name in REPEATS CAPACITY APP_START_TIMEOUT WARMUP_DRAIN_CAP_SECONDS \
+             WARMUP_SETTLE_SECONDS WARMUP_DB_SETTLE_SECONDS; do
   eval "_val=\${${_name}}"
   case "${_val}" in
     ''|*[!0-9]*) echo "${_name} 은 정수여야 한다. 받은 값: '${_val}'" >&2; exit 1 ;;
@@ -271,9 +281,14 @@ for mode in ${MODES}; do
     # 크다 — 같은 6400 RPS 가 따뜻하면 p95 2.15ms, 재기동 직후면 1474ms 였다.
     # 회차마다 재기동하므로, 데우지 않으면 매 회차가 그 1474ms 쪽을 잰다.
     #
-    # run.sh 를 짧게 한 번 더 돌린다. 상태 초기화와 이벤트 생성이 그 안에 있고,
-    # 본 회차가 어차피 다시 비우므로 워밍업이 남긴 행은 섞이지 않는다.
+    # run.sh 를 짧게 한 번 더 돌린다. 상태 초기화와 이벤트 생성이 그 안에 있다.
     # 결과는 버린다 — 불변식이 깨져도 워밍업 회차의 일이라 무시한다.
+    #
+    # 워밍업이 남긴 행이 본 회차 집계에 섞이지는 않는다(모든 집계가 event_id
+    # 로 거른다). 다만 본 회차의 상태 초기화가 그 행들을 DELETE 하고 —
+    # ceiling.env 면 19만 행이다 — InnoDB 가 그 undo 를 백그라운드로 정리하는
+    # 동안 드레이너를 잰다. 드레이너 처리량이 테이블 유지 비용에 민감하다는
+    # 게 이 저장소의 미해결 항목이므로, 이 영향은 아직 정량화되지 않았다.
     #
     # 콜드 상태를 일부러 재려면 WARMUP_DURATION=0 으로 끈다. 배포나
     # 스케일아웃 중에 피크가 오는 상황이 그쪽이다.
@@ -329,14 +344,29 @@ for mode in ${MODES}; do
       # 본 회차의 상태 초기화가 그 위에서 돌고, 드레인 타이머도 한가하지 않은
       # 드레이너를 상대로 시작한다 — 드레이너 처리량 수치가 바로 그 타이머에서
       # 나오므로 그냥 넘어가면 안 된다. 더 기다리고, 결과에도 남긴다.
+      # 얼마나 기다릴지는 모드가 정한다.
+      #
+      # redis 워밍업은 run.sh 가 드레인까지 기다려주므로 끝났을 때 비어 있다.
+      # 예외는 그 대기가 상한에 걸린 경우고, 그때만 길게 잡는다.
+      #
+      # db 는 드레인 단계 자체가 없다(run.sh 는 MODE=redis 일 때만 기다린다).
+      # 그래서 drain.capped 는 db 회차에서 항상 false 다 — 이걸로 분기하면
+      # 정작 기다려야 할 모드가 짧은 쪽을 받는다.
       warmup_settle="${WARMUP_SETTLE_SECONDS}"
-      if [ "${warmup_capped}" = true ]; then
-        # WARMUP_SETTLE_SECONDS=0 이면 곱해도 0 이라, 경고만 찍고 안 기다리는
-        # 꼴이 된다. 그 회차의 드레인 수치가 오염된 채로 넘어가므로 바닥을 둔다.
+      warmup_settle_reason=""
+      if [ "${mode}" = db ]; then
+        warmup_settle="${WARMUP_DB_SETTLE_SECONDS}"
+        warmup_settle_reason="db 는 워밍업에 드레인 대기가 없다"
+      elif [ "${warmup_capped}" = true ]; then
+        # 0 이면 곱해도 0 이라 경고만 찍고 안 기다리는 꼴이 된다. 바닥을 둔다.
         warmup_settle=$(( WARMUP_SETTLE_SECONDS * 6 ))
         [ "${warmup_settle}" -ge 30 ] || warmup_settle=30
-        echo "경고: 워밍업이 드레인 상한(${WARMUP_DRAIN_CAP_SECONDS}s)에 걸렸다." >&2
-        echo "      ${warmup_settle}s 더 기다린다. 이 회차의 드레인 수치는 워밍업 잔량이 섞였을 수 있다." >&2
+        warmup_settle_reason="워밍업이 드레인 상한(${WARMUP_DRAIN_CAP_SECONDS}s)에 걸렸다"
+      fi
+      if [ -n "${warmup_settle_reason}" ]; then
+        echo "${warmup_settle_reason}. ${warmup_settle}s 기다린다." >&2
+        [ "${warmup_capped}" = false ] || \
+          echo "      이 회차의 드레인 수치는 워밍업 잔량이 섞였을 수 있다." >&2
       fi
 
       # 워밍업이 남긴 일이 끝나기를 기다린다.
@@ -374,7 +404,7 @@ echo
 echo "=============================================================="
 echo "  ${CONFIG_NAME} — ${total}회차 중 ${failed}회차 위반"
 echo "=============================================================="
-printf '%-6s %6s %6s %6s %8s %8s %8s %8s %8s  %s\n' \
+printf '%-6s %6s %6s %6s %8s %8s %8s %8s %10s  %s\n' \
   mode batch delay rate 정원 승인 드레인 p95ms 워밍업 위반
 # 이 회차 것만 센다. 같은 설정을 다시 돌리면 결과가 같은 디렉터리에 쌓이는데,
 # 그걸 다 세면 위의 총계와 표가 어긋나고 어느 게 이번 것인지 알 수 없다.
@@ -384,13 +414,21 @@ find "${SWEEP_ROOT}" -name result.json -newermt "${sweep_start_local}" 2>/dev/nu
   # 몇 시간짜리 스윕이 빈손으로 끝난다.
   # 데웠는지를 표에도 싣는다. 파일을 열어야만 알 수 있으면, 스윕이 끝난 자리에서
   # 표만 보고 "이건 웜 수치" 라고 착각한다 — 이 저장소가 실제로 그랬다.
+  #
+  # 길이만 찍으면 안 된다. 워밍업이 2초 만에 죽어 400건만 나가도 '30s' 로
+  # 보이고, 낮은 rate 에서는 정상이어도 요청이 몇 천 건뿐이라 JIT 이 덜 오른다.
+  # '30s/6k' 처럼 실제로 나간 요청 수를 붙여서 표가 스스로 말하게 한다.
   jq -r '[.mode, (.writer.batch_size|tostring), (.writer.delay_ms|tostring),
           (.load.rate|tostring), (.event.capacity|tostring), (.db.accepted|tostring),
           ((.drain.seconds|tostring) + "s"), (.k6.p95_ms|tostring|.[0:7]),
-          ((.load.warmed_by // "?") + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
+          ((.load.warmed_by // "?")
+           + (if (.load.warmup_requests // 0) > 0
+              then "/" + (((.load.warmup_requests / 1000) | floor | tostring) + "k")
+              else "" end)
+           + (if (.load.warmup_drain_capped // false) then "!" else "" end)),
           .violations]
          | @tsv' "$f" 2>/dev/null \
-    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s %8s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' \
+    | awk -F'\t' '{printf "%-6s %6s %6s %6s %8s %8s %8s %8s %10s  %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' \
     || echo "  (읽을 수 없음: ${f})"
 done || true
 
