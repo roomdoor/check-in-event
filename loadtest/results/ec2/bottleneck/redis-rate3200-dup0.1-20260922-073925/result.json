@@ -1,0 +1,50 @@
+{
+  "run_id": "redis-rate3200-dup0.1-20260922-073925",
+  "mode": "redis",
+  "started_at": "2026-09-22T07:39:25Z",
+  "event_id": 3,
+  "where": {
+    "base_url": "http://10.0.1.54:8080",
+    "redis_host": "10.0.1.227",
+    "mysql_host": "10.0.1.227"
+  },
+  "load": {
+    "rate": 3200,
+    "duration": "1m",
+    "dup_ratio": "0.1",
+    "pre_vus": 2000,
+    "max_vus": 8000
+  },
+  "writer": {
+    "batch_size": 1600,
+    "delay_ms": 100
+  },
+  "event": {
+    "capacity": 1000000,
+    "accepted_count": 171983
+  },
+  "db": {
+    "accepted": 171983,
+    "rejected": 0,
+    "total": 171983,
+    "duplicate_keys": 0
+  },
+  "redis": {
+    "count": 171983,
+    "users": 171983,
+    "pos": 171983,
+    "stream_len": 171983
+  },
+  "drain": {
+    "seconds": 0,
+    "capped": false
+  },
+  "k6": {
+    "requests": 190550,
+    "dropped_iterations": 1450,
+    "p95_ms": 617.5855692499995,
+    "duplicate_sent": 18567,
+    "rejected": 0
+  },
+  "violations": "none"
+}
