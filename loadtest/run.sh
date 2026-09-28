@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 측정 한 판. 초기화 -> 이벤트 생성 -> k6 -> 드레인 대기 -> 저장소에서 집계.
+# 측정 한 판. 이벤트 생성 -> 초기화 -> k6 -> 드레인 대기 -> 저장소에서 집계.
 #
 #   ./loadtest/run.sh
 #   MODE=redis RATE=2000 DUP_RATIO=0.1 ./loadtest/run.sh
@@ -313,11 +313,8 @@ fi
 [ "${drain_capped}" = false ] \
   || violations="${violations} 드레인미완(${DRAIN_CAP_SECONDS}s 초과. Redis-DB 대조 생략됨)"
 
-# 초과 승인은 이 스크립트가 존재하는 이유다. 그러니 고장난 카운터에 기대면
-# 안 된다 — events.accepted_count 는 redis 모드에서 늘 0 이라(이슈 #1)
-# 0 <= capacity 로 언제나 통과한다. 정원 1만에 4만을 받아들여도 뜨는 건
-# 아래 '카운터불일치' 하나뿐이고, 그건 무시하라고 적어둔 항목이다.
-# 실제로 저장된 행과 Redis 카운터로 따로 본다.
+# 초과 승인은 이 스크립트가 존재하는 이유다. 실제로 저장된 행과 Redis 카운터를
+# 따로 본다. '초과승인_카운터' 는 DB 모드에서만 독립된 검사다(README "남은 한계").
 [ "${db_accepted:-0}" -le "${evt_capacity:-0}" ] \
   || violations="${violations} 초과승인(승인행=${db_accepted} > capacity=${evt_capacity})"
 [ "${redis_count:-0}" -le "${evt_capacity:-0}" ] \
@@ -331,10 +328,7 @@ fi
   || violations="${violations} 중복행(${db_dup_keys}개 키)"
 # events.accepted_count 는 조회 API가 remaining 을 계산하는 근거다.
 # 실제 승인 행 수와 어긋나면 API가 거짓말을 한다.
-#
-# 주의: 이슈 #1 이 고쳐지기 전까지 redis 모드는 이 검사에서 항상 걸린다.
-# 스크립트 문제가 아니라 드러난 앱 결함이다(rewriteBatchedStatements=true 라
-# 배치 반환값이 -2 로 와서 카운터가 한 번도 안 오른다).
+# redis 모드에서는 사실상 통과가 보장된다(README "남은 한계"). 걸리면 무시하지 말 것.
 [ "${evt_accepted:-0}" -eq "${db_accepted:-0}" ] \
   || violations="${violations} 카운터불일치(accepted_count=${evt_accepted} vs 승인행=${db_accepted})"
 if [ "${MODE}" = "redis" ]; then
